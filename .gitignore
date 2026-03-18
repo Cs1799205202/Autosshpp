@@ -1,1 +1,4 @@
 build/
+.cache/
+autossh-1.4f/
+CLAUDE.md

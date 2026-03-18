@@ -67,8 +67,8 @@ FetchContent_Declare(
 )
 FetchContent_Declare(
     Boost
-    URL https://ghfast.top/https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.7z
-    # URL https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.7z
+    # URL https://ghfast.top/https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.7z
+    URL https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.7z
     URL_HASH SHA256=218e74c4aa362a994b7b7a23b2920f455a00205c656405fcf262cf60b8871921
     DOWNLOAD_EXTRACT_TIMESTAMP ON
     EXCLUDE_FROM_ALL
@@ -87,6 +87,7 @@ target_compile_definitions(autossh PRIVATE $<$<BOOL:${WIN32}>:_WIN32_WINNT=0x0A0
 
 target_sources(autossh PRIVATE
     src/main.cpp
+    src/autossh.cpp
 )
 
 target_link_libraries(autossh PRIVATE
