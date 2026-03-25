@@ -270,10 +270,23 @@ asio::awaitable<void> AutoSSH::main_loop() {
         ssh_.reset();
 
         if (shutting_down_) break;
-        if (!conn_failed && !should_restart(code, first)) {
-            exit_code_ = code;
+        if (conn_failed) {
+            fast_fail_count_++;
+            continue;
+        }
+
+        switch (classify_exit(code, first)) {
+        case RestartAction::restart:
+            continue;
+        case RestartAction::exit_ok:
+            exit_code_ = 0;
+            break;
+        case RestartAction::exit_error:
+            exit_code_ = 1;
             break;
         }
+
+        break;
     }
 
     kill_ssh();
@@ -384,25 +397,38 @@ asio::awaitable<bool> AutoSSH::test_connection_once() {
 //  Restart policy & backoff
 // ════════════════════════════════════════════════════════════════════
 
-bool AutoSSH::should_restart(int exit_code, bool first_attempt) {
-    if (exit_code == 0) {
-        spdlog::info("ssh exited normally, not restarting");
-        return false;
-    }
+AutoSSH::RestartAction AutoSSH::classify_exit(int exit_code, bool first_attempt) {
+    const auto uptime = std::chrono::steady_clock::now() - ssh_start_;
 
-    if (exit_code == 1 && first_attempt &&
-        config_.gate_time > std::chrono::seconds{0})
+    if (first_attempt && config_.gate_time > std::chrono::seconds{0} &&
+        uptime <= config_.gate_time)
     {
-        auto uptime = std::chrono::steady_clock::now() - ssh_start_;
-        if (uptime < config_.gate_time) {
-            spdlog::error("ssh failed quickly on first attempt "
-                          "(within gate time) -- likely a config error");
-            return false;
-        }
+        spdlog::error("ssh exited prematurely with status {} within gate time",
+                      exit_code);
+        return RestartAction::exit_error;
     }
 
-    fast_fail_count_++;
-    return true;
+    switch (exit_code) {
+    case 255:
+        fast_fail_count_++;
+        return RestartAction::restart;
+    case 2:
+    case 1:
+        if (!first_attempt || config_.gate_time == std::chrono::seconds{0}) {
+            fast_fail_count_++;
+            return RestartAction::restart;
+        }
+        spdlog::info("ssh exited with error status {}; autossh++ exiting",
+                     exit_code);
+        return RestartAction::exit_error;
+    case 0:
+        spdlog::info("ssh exited normally, not restarting");
+        return RestartAction::exit_ok;
+    default:
+        spdlog::info("ssh exited with status {}; autossh++ exiting",
+                     exit_code);
+        return RestartAction::exit_error;
+    }
 }
 
 std::chrono::seconds AutoSSH::calculate_backoff() {
@@ -424,7 +450,7 @@ std::chrono::seconds AutoSSH::calculate_backoff() {
     int n = fast_fail_count_ - N_FAST_TRIES;
     auto delay_sec =
         static_cast<int64_t>(n) * n / 3 * config_.poll_time.count() / 100;
-    auto delay = std::chrono::seconds(std::max(delay_sec, int64_t{1}));
+    auto delay = std::chrono::seconds(std::max(delay_sec, static_cast<std::chrono::seconds::rep>(1)));
     return std::min(delay, config_.poll_time);
 }
 

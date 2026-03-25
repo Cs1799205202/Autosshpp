@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.31 FATAL_ERROR)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_MODULE_STD ON)
@@ -95,3 +95,5 @@ target_link_libraries(autossh PRIVATE
     spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>
     Boost::asio Boost::process
 )
+
+# cmake -DCMAKE_BUILD_TYPE:STRING=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE -DCMAKE_C_COMPILER:FILEPATH=/usr/bin/clang-20 -DCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++-20 --no-warn-unused-cli -S /root/projects/Autosshpp -B /root/projects/Autosshpp/build -G Ninja -DBOOST_PROCESS_USE_STD_FS=ON -DCMAKE_CXX_FLAGS=-stdlib=libc++

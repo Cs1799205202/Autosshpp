@@ -21,6 +21,12 @@ public:
     [[nodiscard]] int exit_code() const { return exit_code_; }
 
 private:
+    enum class RestartAction {
+        restart,
+        exit_ok,
+        exit_error,
+    };
+
     void setup_signals();
     void setup_monitor_listener();
 
@@ -34,7 +40,7 @@ private:
     asio::awaitable<bool> test_connection();
     asio::awaitable<bool> test_connection_once();
 
-    bool should_restart(int exit_code, bool first_attempt);
+    RestartAction classify_exit(int exit_code, bool first_attempt);
     std::chrono::seconds calculate_backoff();
     bool check_lifetime();
 
