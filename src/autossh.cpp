@@ -131,10 +131,13 @@ std::vector<std::string> AutoSSH::build_ssh_args() {
     return args;
 }
 
-void AutoSSH::start_ssh() {
+bool AutoSSH::start_ssh() {
     auto args = build_ssh_args();
+    const auto attempt_number = start_count_ + 1;
+    start_count_ = attempt_number;
+    last_attempt_start_ = std::chrono::steady_clock::now();
 
-    spdlog::info("starting ssh (attempt {})", start_count_ + 1);
+    spdlog::info("starting ssh (attempt {})", attempt_number);
     if (spdlog::should_log(spdlog::level::debug)) {
         std::string cmd = config_.ssh_path;
         for (auto& a : args) { cmd += ' '; cmd += a; }
@@ -150,17 +153,18 @@ void AutoSSH::start_ssh() {
             exe = bp::environment::find_executable(config_.ssh_path);
             if (exe.empty()) {
                 spdlog::error("'{}' not found in PATH", config_.ssh_path);
-                return;
+                return false;
             }
         }
 
         // Boost.Process v2: process(executor, path, args)
         ssh_.emplace(io_.get_executor(), exe, args);
-        start_count_++;
-        ssh_start_ = std::chrono::steady_clock::now();
+        ssh_start_ = last_attempt_start_;
+        return true;
     } catch (const std::exception& e) {
         spdlog::error("failed to start ssh: {}", e.what());
         ssh_.reset();
+        return false;
     }
 }
 
@@ -214,9 +218,14 @@ asio::awaitable<void> AutoSSH::main_loop() {
             if (shutting_down_) break;
         }
 
-        start_ssh();
-        if (!ssh_) {
+        if (!start_ssh()) {
             fast_fail_count_++;
+            if (config_.max_starts >= 0 && start_count_ >= config_.max_starts) {
+                spdlog::info("max starts ({}) reached after launch failure",
+                             config_.max_starts);
+                exit_code_ = 1;
+                break;
+            }
             continue;
         }
 
@@ -435,7 +444,7 @@ std::chrono::seconds AutoSSH::calculate_backoff() {
     if (start_count_ == 0)
         return std::chrono::seconds{0};
 
-    auto uptime = std::chrono::steady_clock::now() - ssh_start_;
+    auto uptime = std::chrono::steady_clock::now() - last_attempt_start_;
     auto min_time =
         std::max(config_.poll_time / 10, std::chrono::seconds{10});
 

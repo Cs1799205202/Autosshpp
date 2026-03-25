@@ -31,7 +31,7 @@ private:
     void setup_monitor_listener();
 
     std::vector<std::string> build_ssh_args();
-    void start_ssh();
+    [[nodiscard]] bool start_ssh();
     void kill_ssh();
     bool ssh_running();
 
@@ -61,6 +61,7 @@ private:
     bool shutting_down_    = false;
     int  exit_code_        = 0;
 
+    std::chrono::steady_clock::time_point last_attempt_start_;
     std::chrono::steady_clock::time_point daemon_start_;
     std::chrono::steady_clock::time_point ssh_start_;
 
