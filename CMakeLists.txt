@@ -88,6 +88,7 @@ target_compile_definitions(autossh PRIVATE $<$<BOOL:${WIN32}>:_WIN32_WINNT=0x0A0
 target_sources(autossh PRIVATE
     src/main.cpp
     src/autossh.cpp
+    src/platform_control.cpp
 )
 
 target_link_libraries(autossh PRIVATE

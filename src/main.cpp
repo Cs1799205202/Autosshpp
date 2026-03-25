@@ -5,6 +5,7 @@
 
 #include "config.hpp"
 #include "autossh.hpp"
+#include "platform_control.hpp"
 
 import std;
 
@@ -40,6 +41,15 @@ static void setup_logging(const autosshpp::Config& cfg) {
 
 auto main(int argc, char* argv[]) -> int {
     auto cfg = autosshpp::parse_args(argc, argv);
+
+    auto detach_result = autosshpp::detach_into_background(cfg);
+    if (!detach_result) {
+        std::println(stderr, "error: {}", detach_result.error());
+        return 1;
+    }
+    if (*detach_result)
+        return 0;
+
     setup_logging(cfg);
 
     boost::asio::io_context io;

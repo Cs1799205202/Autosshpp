@@ -4,6 +4,7 @@
 #include <boost/process.hpp>
 
 #include "config.hpp"
+#include "platform_control.hpp"
 
 namespace autosshpp {
 
@@ -28,7 +29,12 @@ private:
     };
 
     void setup_signals();
+    void arm_signal_wait();
+    void arm_force_exit_wait();
     void setup_monitor_listener();
+    void request_action(RequestedAction action);
+    [[nodiscard]] bool stop_requested() const;
+    [[nodiscard]] bool consume_restart_request();
 
     std::vector<std::string> build_ssh_args();
     [[nodiscard]] bool start_ssh();
@@ -58,8 +64,9 @@ private:
 
     int  start_count_      = 0;
     int  fast_fail_count_  = 0;
-    bool shutting_down_    = false;
     int  exit_code_        = 0;
+    bool skip_backoff_once_ = false;
+    RequestedAction requested_action_ = RequestedAction::none;
 
     std::chrono::steady_clock::time_point last_attempt_start_;
     std::chrono::steady_clock::time_point daemon_start_;

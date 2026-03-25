@@ -30,7 +30,7 @@ AutoSSH::AutoSSH(asio::io_context& io, Config config)
     : io_(io)
     , config_(std::move(config))
     , poll_timer_(io)
-    , signals_(io, SIGINT, SIGTERM)
+    , signals_(io)
 {
     auto hostname = asio::ip::host_name();
 #ifdef _WIN32
@@ -82,16 +82,40 @@ void AutoSSH::run() {
 // ════════════════════════════════════════════════════════════════════
 
 void AutoSSH::setup_signals() {
+    for (const auto signal_number : platform_control_signals())
+        signals_.add(signal_number);
+
+    arm_signal_wait();
+}
+
+void AutoSSH::arm_signal_wait() {
     signals_.async_wait([this](error_code ec, int sig) {
-        if (ec) return;
-        spdlog::info("received signal {}, shutting down", sig);
-        shutting_down_ = true;
-        poll_timer_.cancel();
-        kill_ssh();
-        // Re-arm: force-exit on a second signal.
-        signals_.async_wait([](error_code ec2, int) {
-            if (!ec2) std::exit(1);
-        });
+        if (ec)
+            return;
+
+        const auto action = requested_action_for_signal(sig);
+        switch (action) {
+        case RequestedAction::restart:
+            spdlog::info("received signal {}, restart requested", sig);
+            request_action(RequestedAction::restart);
+            arm_signal_wait();
+            return;
+        case RequestedAction::stop:
+            spdlog::info("received signal {}, shutting down", sig);
+            request_action(RequestedAction::stop);
+            arm_force_exit_wait();
+            return;
+        case RequestedAction::none:
+            arm_signal_wait();
+            return;
+        }
+    });
+}
+
+void AutoSSH::arm_force_exit_wait() {
+    signals_.async_wait([](error_code ec, int) {
+        if (!ec)
+            std::exit(1);
     });
 }
 
@@ -104,6 +128,41 @@ void AutoSSH::setup_monitor_listener() {
 
     spdlog::info("monitor: write port {}, read port {}",
                  config_.write_port(), config_.read_port());
+}
+
+void AutoSSH::request_action(RequestedAction action) {
+    if (requested_action_ == RequestedAction::stop)
+        return;
+
+    if (action == RequestedAction::stop) {
+        requested_action_ = RequestedAction::stop;
+    } else if (action == RequestedAction::restart) {
+        if (requested_action_ == RequestedAction::restart)
+            return;
+        requested_action_ = RequestedAction::restart;
+        skip_backoff_once_ = true;
+    } else {
+        return;
+    }
+
+    poll_timer_.cancel();
+    if (monitor_acceptor_) {
+        error_code ec;
+        monitor_acceptor_->cancel(ec);
+    }
+    kill_ssh();
+}
+
+bool AutoSSH::stop_requested() const {
+    return requested_action_ == RequestedAction::stop;
+}
+
+bool AutoSSH::consume_restart_request() {
+    if (requested_action_ != RequestedAction::restart)
+        return false;
+
+    requested_action_ = RequestedAction::none;
+    return true;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -135,6 +194,7 @@ bool AutoSSH::start_ssh() {
     auto args = build_ssh_args();
     const auto attempt_number = start_count_ + 1;
     start_count_ = attempt_number;
+    skip_backoff_once_ = false;
     last_attempt_start_ = std::chrono::steady_clock::now();
 
     spdlog::info("starting ssh (attempt {})", attempt_number);
@@ -194,14 +254,13 @@ bool AutoSSH::ssh_running() {
 // ════════════════════════════════════════════════════════════════════
 
 asio::awaitable<void> AutoSSH::main_loop() {
-    auto executor = co_await asio::this_coro::executor;
     daemon_start_ = std::chrono::steady_clock::now();
 
     spdlog::info("autossh++ {} starting", VERSION);
     if (!config_.monitoring_enabled)
         spdlog::info("monitoring disabled (-M 0), relying on SSH ServerAlive");
 
-    while (!shutting_down_) {
+    while (!stop_requested()) {
         if (config_.max_starts >= 0 && start_count_ >= config_.max_starts) {
             spdlog::info("max starts ({}) reached", config_.max_starts);
             break;
@@ -211,12 +270,15 @@ asio::awaitable<void> AutoSSH::main_loop() {
         auto backoff = calculate_backoff();
         if (backoff > std::chrono::seconds{0}) {
             spdlog::info("backoff: waiting {}s before restart", backoff.count());
-            asio::steady_timer timer(executor);
-            timer.expires_after(backoff);
-            auto [ec] = co_await timer.async_wait(
+            poll_timer_.expires_after(backoff);
+            auto [ec] = co_await poll_timer_.async_wait(
                 asio::as_tuple(asio::use_awaitable));
-            if (shutting_down_) break;
+            if (stop_requested())
+                break;
         }
+
+        if (consume_restart_request())
+            spdlog::info("processing requested restart");
 
         if (!start_ssh()) {
             fast_fail_count_++;
@@ -235,7 +297,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
             : config_.poll_time;
         bool conn_failed = false;
 
-        while (ssh_running() && !shutting_down_) {
+        while (ssh_running() && !stop_requested()) {
             if (config_.max_lifetime > std::chrono::seconds{0}) {
                 auto elapsed =
                     std::chrono::duration_cast<std::chrono::seconds>(
@@ -246,7 +308,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
             }
 
             bool still_up = co_await wait_or_ssh_exit(poll_delay);
-            if (!still_up || shutting_down_) break;
+            if (!still_up || stop_requested()) break;
 
             if (config_.monitoring_enabled) {
                 spdlog::debug("testing connection...");
@@ -278,7 +340,12 @@ asio::awaitable<void> AutoSSH::main_loop() {
 
         ssh_.reset();
 
-        if (shutting_down_) break;
+        if (stop_requested())
+            break;
+        if (consume_restart_request()) {
+            spdlog::info("processing requested restart");
+            continue;
+        }
         if (conn_failed) {
             fast_fail_count_++;
             continue;
@@ -311,7 +378,7 @@ AutoSSH::wait_or_ssh_exit(std::chrono::seconds duration) {
     auto deadline = std::chrono::steady_clock::now() + duration;
 
     while (std::chrono::steady_clock::now() < deadline) {
-        if (!ssh_running() || shutting_down_)
+        if (!ssh_running() || stop_requested())
             co_return false;
 
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -324,7 +391,7 @@ AutoSSH::wait_or_ssh_exit(std::chrono::seconds duration) {
             asio::as_tuple(asio::use_awaitable));
     }
 
-    co_return ssh_running() && !shutting_down_;
+    co_return ssh_running() && !stop_requested();
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -335,7 +402,7 @@ asio::awaitable<bool> AutoSSH::test_connection() {
     for (int i = 0; i < MAX_CONN_TRIES; i++) {
         if (co_await test_connection_once())
             co_return true;
-        if (shutting_down_ || !ssh_running())
+        if (stop_requested() || !ssh_running())
             co_return false;
         spdlog::debug("connection test attempt {}/{} failed",
                       i + 1, MAX_CONN_TRIES);
@@ -442,6 +509,8 @@ AutoSSH::RestartAction AutoSSH::classify_exit(int exit_code, bool first_attempt)
 
 std::chrono::seconds AutoSSH::calculate_backoff() {
     if (start_count_ == 0)
+        return std::chrono::seconds{0};
+    if (skip_backoff_once_)
         return std::chrono::seconds{0};
 
     auto uptime = std::chrono::steady_clock::now() - last_attempt_start_;
