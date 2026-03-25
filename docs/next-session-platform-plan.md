@@ -16,29 +16,45 @@ The current tree already fixes the following review items:
   - child calls `setsid()`
   - stdin/stdout/stderr are redirected to `/dev/null`
   - detached supervisor continues the normal main loop
+- Windows real `-f` background mode:
+  - parent relaunches the same executable with hidden `--autosshpp-detached`
+  - detached child is created with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+  - the hidden marker is stripped before normal CLI parsing, help output, and forwarded SSH args
+  - detached supervisor continues the normal main loop and writes the pid file
+- shared control CLI:
+  - `autossh --control restart --pid <pid>`
+  - `autossh --control stop --pid <pid>`
+- Windows native restart/stop control:
+  - supervisor creates per-pid named events
+  - control CLI opens and signals those named events
+  - event listeners feed the same shared requested-action path used by POSIX signals
+  - restart requests replace the current child
+  - stop requests shut the supervisor down and remove the pid file
 
-The current buildable snapshot also keeps `CMAKE_CXX_STANDARD` at `26` in
+The current committed tree still keeps `CMAKE_CXX_STANDARD` at `26` in
 `CMakeLists.txt`. The implementation style in the recent changes uses modern
 C++ facilities such as `std::expected`, `std::string_view`, `std::from_chars`,
-and chrono-based normalization logic.
+chrono-based normalization logic, and the existing shared supervisor/control
+boundary.
 
 ## Remaining Gaps
 
-The main compatibility gaps that still need work are:
+The main compatibility gap that still needs work is:
 
-1. Windows real `-f` background mode.
-   POSIX detach is now implemented. Windows still needs a detached relaunch
-   path with an internal marker such as `--autosshpp-detached`.
+1. Child termination semantics.
+   The current `Boost.Process v2` `terminate()` path is still more aggressive
+   than original autossh, especially on POSIX. The current logic is in
+   `AutoSSH::kill_ssh()`. Now that detach and external restart/stop control are
+   in place on both POSIX and Windows, the next round should revisit graceful
+   shutdown and escalation policy.
 
-2. Windows restart control.
-   The shared requested-action path now exists, and POSIX `SIGUSR1` is wired
-   into it. Windows still needs a native transport that can request restart
-   and later possibly stop.
+Secondary non-functional follow-up:
 
-3. Child termination semantics.
-   The current `Boost.Process v2` `terminate()` path is more aggressive than
-   original autossh on POSIX. This is not blocked on the other work, but it
-   should be revisited once the restart/detach model is stabilized.
+2. Fresh Windows review-build validation.
+   Manual verification and incremental builds passed on Windows, but a clean
+   `cmake --fresh ... -B build-review` run still hit a local
+   command-line/FetchContent issue in this environment. That is separate from
+   the autossh behavior fixes, but it is still worth cleaning up.
 
 ## Cross-Platform Direction
 
@@ -77,16 +93,27 @@ Current model:
 
 Current split:
 
+- `src/main.cpp`
+  - parses config
+  - dispatches `--control ... --pid ...` before normal supervisor startup
+  - enters normal detach + supervisor flow otherwise
+- `src/config.hpp`
+  - owns CLI parsing
+  - strips the hidden detached relaunch marker before normal argument parsing
+  - parses control-mode arguments
 - `src/autossh.cpp`
   - owns restart policy, backoff, monitoring, and the main loop
   - consumes the shared requested-action state
+  - on Windows, waits on named control events and translates them into requested actions
 - `src/platform_control.hpp`
-  - declares the requested-action enum
-  - maps platform signals to requested actions
-  - owns background-detach entry points
+  - declares requested-action types
+  - declares platform signal/control helpers
+  - declares background-detach entry points
 - `src/platform_control.cpp`
   - implements POSIX signal mapping and POSIX detach
-  - currently returns a "not implemented yet" error for Windows `-f`
+  - implements Windows detached relaunch
+  - implements control-request sending
+  - implements Windows named-event helpers
 
 Avoid making the main loop know whether requests came from:
 
@@ -115,26 +142,15 @@ necessary later.
 
 ### Windows
 
-There is no `daemon()` equivalent. The next step is still a detached relaunch
-model:
+Implemented in the current tree as detached relaunch:
 
 - parse `-f`
-- relaunch the same executable with an internal marker like
-  `--autosshpp-detached`
+- relaunch the same executable with hidden `--autosshpp-detached`
 - create the new process with detached/background-friendly flags
 - parent exits successfully
 - child continues in normal supervisor mode
 
-This keeps the public contract similar to POSIX without pretending the OS model
-is the same.
-
-The internal detached marker should not leak into user-facing help.
-
-Current status:
-
-- Windows `-f` is not implemented yet
-- the current code reports an explicit runtime error instead of silently
-  pretending to daemonize
+The hidden detached marker does not appear in user-facing help output.
 
 ## Restart Control
 
@@ -146,39 +162,31 @@ Implemented in the current tree:
 - `SIGINT` / `SIGTERM` request stop
 - restart requests cancel the current wait and skip backoff once
 - stop requests cancel the current wait and shut the supervisor down
+- `--control restart --pid <pid>` maps to the POSIX restart signal
+- `--control stop --pid <pid>` maps to the POSIX stop signal
 
 ### Windows
 
-Do not try to emulate `SIGUSR1` literally. Windows still needs a restart
-control channel. Viable choices:
+Implemented in the current tree using named events keyed by supervisor pid:
 
-- named pipe
-- localhost control socket
-- named event plus a small helper CLI
+- `--control restart --pid <pid>` signals the restart event
+- `--control stop --pid <pid>` signals the stop event
+- supervisor listeners translate those events into shared requested actions
+- restart requests replace the current child
+- stop requests remove the pid file and exit the supervisor
 
-The cleanest user-facing model is probably a tiny control command later, for
-example:
-
-```text
-autossh --control restart --pid <pid>
-```
-
-Under POSIX, that helper can still send `SIGUSR1` for compatibility if desired.
-Under Windows, it can speak to the native control channel.
+This keeps the supervisor loop platform-neutral while still using native
+Windows primitives instead of pretending `SIGUSR1` exists.
 
 ## Suggested Implementation Order
 
-1. Add hidden internal detached-mode parsing for Windows, for example
-   `--autosshpp-detached`.
-2. Preserve or reconstruct the original command line for Windows relaunch.
-3. Implement Windows detached relaunch in `src/platform_control.cpp`.
-4. Verify that `-f` returns immediately while the relaunched supervisor keeps
-   running and still writes the pid file from the detached instance.
-5. Implement a Windows restart control transport on top of the existing
-   requested-action path.
-6. Add a small control CLI shape if needed, for example
-   `--control restart --pid <pid>`.
-7. Revisit child termination behavior and graceful shutdown policy.
+1. Revisit `AutoSSH::kill_ssh()` and define the desired graceful shutdown policy.
+2. Decide whether restart and stop should share the same escalation path or have
+   slightly different behavior.
+3. Add targeted tests or manual scripts for restart/stop races and child-exit
+   races.
+4. Clean up the Windows fresh-review-build path if reproducible in the next
+   environment.
 
 ## Validation Checklist
 
@@ -196,26 +204,31 @@ After the next round of work, rerun these checks:
   - child exits `255` immediately
 - `AUTOSSH_MAXSTART=1` with a missing `AUTOSSH_PATH` exits quickly with failure
 - repeated launch failures participate in backoff
-- POSIX only:
+- POSIX:
   - `-f` returns immediately while the detached supervisor keeps running
   - `SIGUSR1` triggers a restart
-- Windows only:
-  - `-f` returns immediately while the detached relaunched supervisor keeps
-    running
+  - `--control restart --pid <pid>` also triggers a restart
+  - `SIGTERM` or `--control stop --pid <pid>` shuts the supervisor down
+- Windows:
+  - `-f` returns immediately while the detached relaunched supervisor keeps running
   - the detached instance writes the pid file, not the short-lived parent
-  - restarting through the Windows control path actually replaces the child
+  - `--control restart --pid <pid>` actually replaces the child
+  - `--control stop --pid <pid>` shuts the supervisor down and removes the pid file
   - the hidden detached marker does not appear in user-facing help output
 
 ## Notes For The Next Session
 
-- The current tree is buildable.
-- The new config parser behavior was verified after a clean `cmake --fresh`
-  rebuild.
-- The POSIX control-path work was manually verified on Linux:
+- The current tree is buildable in the existing `build/` directory on Windows.
+- Windows manual verification completed in this session:
+  - `-f` returned immediately and left a detached supervisor running
+  - the detached instance wrote the pid file
+  - `--control restart --pid <pid>` replaced the child process
+  - `--control stop --pid <pid>` shut the supervisor down and removed the pid file
+- The POSIX control-path work had already been manually verified on Linux:
   - `-f` returned immediately and left a detached supervisor running
   - `SIGUSR1` restarted the child process
   - `SIGTERM` shut the detached supervisor down and removed the pid file
-- The next session is expected to run on Windows 11, so focus should move to
-  detached relaunch and Windows-native restart control.
-- `.gitignore` still has local changes that were intentionally not included in
-  the commit because they are unrelated to the current functional fixes.
+- The next session should focus on graceful child shutdown semantics instead of
+  more platform-control plumbing.
+- Some working trees may still have unrelated local changes in `.gitignore` or
+  `CMakeLists.txt`; those were intentionally not part of this functional work.

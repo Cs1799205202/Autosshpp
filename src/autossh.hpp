@@ -3,6 +3,10 @@
 #include <boost/asio.hpp>
 #include <boost/process.hpp>
 
+#ifdef _WIN32
+#  include <boost/asio/windows/object_handle.hpp>
+#endif
+
 #include "config.hpp"
 #include "platform_control.hpp"
 
@@ -31,6 +35,11 @@ private:
     void setup_signals();
     void arm_signal_wait();
     void arm_force_exit_wait();
+    [[nodiscard]] auto setup_platform_control() -> std::expected<void, std::string>;
+#ifdef _WIN32
+    void arm_platform_control_wait(asio::windows::object_handle& handle,
+                                   RequestedAction action);
+#endif
     void setup_monitor_listener();
     void request_action(RequestedAction action);
     [[nodiscard]] bool stop_requested() const;
@@ -61,6 +70,10 @@ private:
     std::optional<tcp::acceptor> monitor_acceptor_;
     asio::steady_timer poll_timer_;
     asio::signal_set signals_;
+#ifdef _WIN32
+    std::optional<asio::windows::object_handle> restart_control_event_;
+    std::optional<asio::windows::object_handle> stop_control_event_;
+#endif
 
     int  start_count_      = 0;
     int  fast_fail_count_  = 0;

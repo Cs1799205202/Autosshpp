@@ -57,6 +57,11 @@ AutoSSH::~AutoSSH() {
 
 void AutoSSH::run() {
     setup_signals();
+    if (auto platform_control = setup_platform_control(); !platform_control) {
+        spdlog::error("fatal: {}", platform_control.error());
+        exit_code_ = 1;
+        return;
+    }
 
     if (config_.monitoring_enabled && config_.echo_port == 0)
         setup_monitor_listener();
@@ -118,6 +123,61 @@ void AutoSSH::arm_force_exit_wait() {
             std::exit(1);
     });
 }
+
+auto AutoSSH::setup_platform_control() -> std::expected<void, std::string> {
+#ifdef _WIN32
+    const auto pid = static_cast<DWORD>(_getpid());
+
+    auto restart_event = create_control_event(RequestedAction::restart, pid);
+    if (!restart_event)
+        return std::unexpected(restart_event.error());
+
+    auto stop_event = create_control_event(RequestedAction::stop, pid);
+    if (!stop_event) {
+        ::CloseHandle(*restart_event);
+        return std::unexpected(stop_event.error());
+    }
+
+    restart_control_event_.emplace(io_, *restart_event);
+    stop_control_event_.emplace(io_, *stop_event);
+
+    arm_platform_control_wait(*restart_control_event_, RequestedAction::restart);
+    arm_platform_control_wait(*stop_control_event_, RequestedAction::stop);
+#endif
+
+    return {};
+}
+
+#ifdef _WIN32
+void AutoSSH::arm_platform_control_wait(asio::windows::object_handle& handle,
+                                        RequestedAction action) {
+    handle.async_wait([this, &handle, action](error_code ec) {
+        if (ec)
+            return;
+
+        switch (action) {
+        case RequestedAction::restart:
+            spdlog::info("received Windows control restart request");
+            request_action(RequestedAction::restart);
+            arm_platform_control_wait(handle, action);
+            return;
+        case RequestedAction::stop:
+            if (stop_requested()) {
+                spdlog::warn(
+                    "received second Windows control stop request, forcing exit");
+                std::exit(1);
+            }
+            spdlog::info("received Windows control stop request");
+            request_action(RequestedAction::stop);
+            arm_platform_control_wait(handle, action);
+            return;
+        case RequestedAction::none:
+            arm_platform_control_wait(handle, action);
+            return;
+        }
+    });
+}
+#endif
 
 void AutoSSH::setup_monitor_listener() {
     auto ep = tcp::endpoint(asio::ip::make_address("127.0.0.1"),

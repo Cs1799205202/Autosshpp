@@ -24,6 +24,14 @@ inline constexpr int DEFAULT_NET_TIMEOUT = 15000;  // milliseconds
 inline constexpr int MAX_CONN_TRIES = 3;
 inline constexpr int N_FAST_TRIES = 5;
 inline constexpr std::size_t MAX_MESSAGE_BYTES = 64;
+inline constexpr std::string_view DETACHED_RELAUNCH_MARKER =
+    "--autosshpp-detached";
+
+enum class ControlCommand {
+    none,
+    stop,
+    restart,
+};
 
 struct Config {
     // Monitor settings
@@ -54,6 +62,9 @@ struct Config {
 
     // Flags
     bool run_as_daemon = false;
+    bool detached_relaunch = false;
+    ControlCommand control_command = ControlCommand::none;
+    int control_pid = 0;
 
     // Derived helpers
     [[nodiscard]] uint16_t write_port() const { return monitor_port; }
@@ -72,6 +83,42 @@ struct EnvOverrides {
     bool has_monitor_port = false;
     bool has_first_poll = false;
 };
+
+struct SanitizedArgv {
+    std::vector<char*> argv;
+    bool detached_relaunch = false;
+};
+
+[[nodiscard]] inline auto sanitize_argv(int argc, char* argv[]) -> SanitizedArgv {
+    SanitizedArgv sanitized;
+    sanitized.argv.reserve(static_cast<std::size_t>(argc));
+
+    for (int index = 0; index < argc; ++index) {
+        if (index != 0 &&
+            std::string_view{argv[index]} == DETACHED_RELAUNCH_MARKER)
+        {
+            sanitized.detached_relaunch = true;
+            continue;
+        }
+
+        sanitized.argv.push_back(argv[index]);
+    }
+
+    return sanitized;
+}
+
+[[nodiscard]] inline auto parse_control_command(std::string_view text)
+    -> std::expected<ControlCommand, std::string>
+{
+    if (text == "restart")
+        return ControlCommand::restart;
+    if (text == "stop")
+        return ControlCommand::stop;
+
+    return std::unexpected(std::format(
+        "unsupported control action \"{}\" (expected restart or stop)",
+        text));
+}
 
 template <typename T>
 [[nodiscard]] auto parse_integer(std::string_view text,
@@ -252,6 +299,9 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
 [[nodiscard]] inline Config parse_args(int argc, char* argv[]) {
     using namespace detail;
 
+    auto sanitized_argv = sanitize_argv(argc, argv);
+    constexpr auto max_int = std::numeric_limits<int>::max();
+
     // Only auto-add --help; we handle version ourselves via -V.
     argparse::ArgumentParser program("autossh", VERSION,
         argparse::default_arguments::help);
@@ -271,6 +321,14 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
         .help("run in background (daemon mode)")
         .flag();
 
+    program.add_argument("--control")
+        .help("send a control action to a running autossh instance")
+        .metavar("ACTION");
+
+    program.add_argument("--pid")
+        .help("target autossh process id for --control")
+        .metavar("PID");
+
     // Stringifies the argparse help (argparse only supports ostream).
     auto help = [&] {
         std::ostringstream oss;
@@ -285,7 +343,9 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
     // parse_known_args lets unknown SSH flags (-o, -p, etc.) pass through.
     std::vector<std::string> unrecognized;
     try {
-        unrecognized = program.parse_known_args(argc, argv);
+        unrecognized = program.parse_known_args(
+            static_cast<int>(sanitized_argv.argv.size()),
+            sanitized_argv.argv.data());
     } catch (const std::exception& e) {
         fail(e.what());
     }
@@ -296,6 +356,35 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
     }
 
     Config cfg;
+    cfg.detached_relaunch = sanitized_argv.detached_relaunch;
+
+    if (program.is_used("--control")) {
+        if (program.is_used("-M"))
+            fail("-M cannot be used with --control");
+        if (program.get<bool>("-f"))
+            fail("-f cannot be used with --control");
+        if (!unrecognized.empty())
+            fail("control mode does not accept ssh arguments");
+        if (!program.is_used("--pid"))
+            fail("--pid is required with --control");
+
+        auto control_command = parse_control_command(program.get("--control"));
+        if (!control_command)
+            fail(control_command.error());
+
+        auto control_pid = parse_integer<int>(
+            program.get("--pid"), "control pid", 1, max_int);
+        if (!control_pid)
+            fail(control_pid.error());
+
+        cfg.control_command = *control_command;
+        cfg.control_pid = *control_pid;
+        return cfg;
+    }
+
+    if (program.is_used("--pid"))
+        fail("--pid requires --control");
+
     auto env_overrides = read_env(cfg);
     if (!env_overrides)
         fail(env_overrides.error());

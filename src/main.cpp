@@ -42,6 +42,16 @@ static void setup_logging(const autosshpp::Config& cfg) {
 auto main(int argc, char* argv[]) -> int {
     auto cfg = autosshpp::parse_args(argc, argv);
 
+    if (cfg.control_command != autosshpp::ControlCommand::none) {
+        auto control_result =
+            autosshpp::send_control_request(cfg.control_command, cfg.control_pid);
+        if (!control_result) {
+            std::println(stderr, "error: {}", control_result.error());
+            return 1;
+        }
+        return 0;
+    }
+
     auto detach_result = autosshpp::detach_into_background(cfg);
     if (!detach_result) {
         std::println(stderr, "error: {}", detach_result.error());
