@@ -3,7 +3,6 @@ module;
 #include <cerrno>
 #include <cstring>
 #include <format>
-#include <system_error>
 
 #ifdef _WIN32
 #  include <csignal>

@@ -1,5 +1,4 @@
 #include <boost/asio.hpp>
-#include <cstdio>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
