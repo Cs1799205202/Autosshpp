@@ -22,6 +22,13 @@ namespace autosshpp {
 
 using error_code = boost::system::error_code;
 
+namespace {
+
+constexpr auto SSH_SHUTDOWN_GRACE_PERIOD = std::chrono::seconds{5};
+constexpr auto SSH_SHUTDOWN_POLL_INTERVAL = std::chrono::milliseconds{100};
+
+}  // namespace
+
 // ════════════════════════════════════════════════════════════════════
 //  Construction / destruction
 // ════════════════════════════════════════════════════════════════════
@@ -30,6 +37,7 @@ AutoSSH::AutoSSH(asio::io_context& io, Config config)
     : io_(io)
     , config_(std::move(config))
     , poll_timer_(io)
+    , shutdown_timer_(io)
     , signals_(io)
 {
     auto hostname = asio::ip::host_name();
@@ -118,9 +126,12 @@ void AutoSSH::arm_signal_wait() {
 }
 
 void AutoSSH::arm_force_exit_wait() {
-    signals_.async_wait([](error_code ec, int) {
-        if (!ec)
+    signals_.async_wait([this](error_code ec, int) {
+        if (!ec) {
+            force_terminate_ssh();
+            remove_pid_file();
             std::exit(1);
+        }
     });
 }
 
@@ -165,6 +176,8 @@ void AutoSSH::arm_platform_control_wait(asio::windows::object_handle& handle,
             if (stop_requested()) {
                 spdlog::warn(
                     "received second Windows control stop request, forcing exit");
+                force_terminate_ssh();
+                remove_pid_file();
                 std::exit(1);
             }
             spdlog::info("received Windows control stop request");
@@ -210,7 +223,7 @@ void AutoSSH::request_action(RequestedAction action) {
         error_code ec;
         monitor_acceptor_->cancel(ec);
     }
-    kill_ssh();
+    begin_ssh_shutdown();
 }
 
 bool AutoSSH::stop_requested() const {
@@ -279,6 +292,7 @@ bool AutoSSH::start_ssh() {
 
         // Boost.Process v2: process(executor, path, args)
         ssh_.emplace(io_.get_executor(), exe, args);
+        clear_ssh_shutdown_state();
         ssh_start_ = last_attempt_start_;
         return true;
     } catch (const std::exception& e) {
@@ -288,15 +302,101 @@ bool AutoSSH::start_ssh() {
     }
 }
 
-void AutoSSH::kill_ssh() {
-    if (!ssh_) return;
-    try {
-        error_code ec;
-        if (ssh_->running(ec)) {
-            ssh_->terminate(ec);
-            ssh_->wait(ec);
-        }
-    } catch (...) {}
+void AutoSSH::begin_ssh_shutdown() {
+    if (!ssh_)
+        return;
+
+    error_code ec;
+    if (!ssh_->running(ec))
+        return;
+    if (ec) {
+        spdlog::warn("failed to query ssh process state before shutdown: {}",
+                     ec.message());
+        return;
+    }
+
+    if (ssh_shutdown_stage_ != SshShutdownStage::none)
+        return;
+
+#ifndef _WIN32
+    ssh_->request_exit(ec);
+    if (!ec) {
+        ssh_shutdown_stage_ = SshShutdownStage::graceful;
+        ++ssh_shutdown_generation_;
+        spdlog::info("requested graceful ssh shutdown");
+        arm_ssh_shutdown_timer(ssh_shutdown_generation_);
+        return;
+    }
+
+    error_code still_running_ec;
+    if (!ssh_->running(still_running_ec))
+        return;
+
+    spdlog::warn("failed to request graceful ssh shutdown: {}", ec.message());
+#endif
+
+    force_terminate_ssh();
+}
+
+void AutoSSH::arm_ssh_shutdown_timer(std::uint64_t shutdown_generation) {
+    shutdown_timer_.expires_after(SSH_SHUTDOWN_GRACE_PERIOD);
+    shutdown_timer_.async_wait(
+        [this, shutdown_generation](error_code ec) {
+            if (ec || shutdown_generation != ssh_shutdown_generation_ ||
+                ssh_shutdown_stage_ != SshShutdownStage::graceful)
+            {
+                return;
+            }
+
+            if (!ssh_)
+                return;
+
+            error_code running_ec;
+            if (!ssh_->running(running_ec))
+                return;
+
+            if (running_ec) {
+                spdlog::warn(
+                    "failed while waiting for graceful ssh shutdown: {}",
+                    running_ec.message());
+            } else {
+                spdlog::warn(
+                    "ssh did not exit after {}s grace period, forcing termination",
+                    SSH_SHUTDOWN_GRACE_PERIOD.count());
+            }
+
+            force_terminate_ssh();
+        });
+}
+
+void AutoSSH::force_terminate_ssh() {
+    if (!ssh_)
+        return;
+
+    error_code ec;
+    if (!ssh_->running(ec))
+        return;
+    if (ec) {
+        spdlog::warn("failed to query ssh process state before termination: {}",
+                     ec.message());
+        return;
+    }
+
+    ssh_->terminate(ec);
+    if (ec) {
+        spdlog::warn("failed to terminate ssh process: {}", ec.message());
+        return;
+    }
+
+    ssh_shutdown_stage_ = SshShutdownStage::forced;
+    ++ssh_shutdown_generation_;
+    spdlog::info("terminated ssh process");
+}
+
+void AutoSSH::clear_ssh_shutdown_state() {
+    ++ssh_shutdown_generation_;
+    ssh_shutdown_stage_ = SshShutdownStage::none;
+    shutdown_timer_.cancel();
 }
 
 bool AutoSSH::ssh_running() {
@@ -307,6 +407,23 @@ bool AutoSSH::ssh_running() {
     } catch (...) {
         return false;
     }
+}
+
+asio::awaitable<void> AutoSSH::wait_for_ssh_shutdown() {
+    if (!ssh_) {
+        clear_ssh_shutdown_state();
+        co_return;
+    }
+
+    begin_ssh_shutdown();
+
+    while (ssh_running()) {
+        poll_timer_.expires_after(SSH_SHUTDOWN_POLL_INTERVAL);
+        co_await poll_timer_.async_wait(
+            asio::as_tuple(asio::use_awaitable));
+    }
+
+    clear_ssh_shutdown_state();
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -356,6 +473,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
             ? config_.effective_first_poll()
             : config_.poll_time;
         bool conn_failed = false;
+        bool lifetime_reached = false;
 
         while (ssh_running() && !stop_requested()) {
             if (config_.max_lifetime > std::chrono::seconds{0}) {
@@ -363,7 +481,11 @@ asio::awaitable<void> AutoSSH::main_loop() {
                     std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now() - daemon_start_);
                 auto remaining = config_.max_lifetime - elapsed;
-                if (remaining <= std::chrono::seconds{0}) break;
+                if (remaining <= std::chrono::seconds{0}) {
+                    lifetime_reached = true;
+                    begin_ssh_shutdown();
+                    break;
+                }
                 poll_delay = std::min(poll_delay, remaining);
             }
 
@@ -375,7 +497,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
                 bool alive = co_await test_connection();
                 if (!alive && ssh_running()) {
                     spdlog::warn("connection test failed, restarting ssh");
-                    kill_ssh();
+                    begin_ssh_shutdown();
                     conn_failed = true;
                     break;
                 }
@@ -386,6 +508,13 @@ asio::awaitable<void> AutoSSH::main_loop() {
         }
 
         int code = 0;
+        if (ssh_ && (conn_failed || lifetime_reached ||
+                     requested_action_ != RequestedAction::none ||
+                     stop_requested()))
+        {
+            co_await wait_for_ssh_shutdown();
+        }
+
         if (conn_failed) {
             code = 255;
         } else if (ssh_) {
@@ -399,12 +528,17 @@ asio::awaitable<void> AutoSSH::main_loop() {
         spdlog::info("ssh exited (code {}), uptime: {}s", code, uptime.count());
 
         ssh_.reset();
+        clear_ssh_shutdown_state();
 
         if (stop_requested())
             break;
         if (consume_restart_request()) {
             spdlog::info("processing requested restart");
             continue;
+        }
+        if (lifetime_reached) {
+            exit_code_ = 0;
+            break;
         }
         if (conn_failed) {
             fast_fail_count_++;
@@ -425,7 +559,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
         break;
     }
 
-    kill_ssh();
+    co_await wait_for_ssh_shutdown();
     spdlog::info("autossh++ exiting");
 }
 

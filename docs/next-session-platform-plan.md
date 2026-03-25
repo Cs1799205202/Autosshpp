@@ -30,6 +30,14 @@ The current tree already fixes the following review items:
   - event listeners feed the same shared requested-action path used by POSIX signals
   - restart requests replace the current child
   - stop requests shut the supervisor down and remove the pid file
+- asynchronous child shutdown handling:
+  - shared requested-action flow now begins child shutdown without blocking the
+    supervisor event loop
+  - POSIX requests graceful child exit first and escalates after a 5 second
+    grace period if the child is still running
+  - escalation is timer-driven instead of using a blocking sleep/wait loop
+  - a second stop request forces immediate supervisor exit, kills the child if
+    needed, and removes the pid file
 
 The current committed tree still keeps `CMAKE_CXX_STANDARD` at `26` in
 `CMakeLists.txt`. The implementation style in the recent changes uses modern
@@ -39,14 +47,13 @@ boundary.
 
 ## Remaining Gaps
 
-The main compatibility gap that still needs work is:
+The main functional follow-up that still needs work is:
 
-1. Child termination semantics.
-   The current `Boost.Process v2` `terminate()` path is still more aggressive
-   than original autossh, especially on POSIX. The current logic is in
-   `AutoSSH::kill_ssh()`. Now that detach and external restart/stop control are
-   in place on both POSIX and Windows, the next round should revisit graceful
-   shutdown and escalation policy.
+1. Windows child-shutdown parity.
+   POSIX now has the intended graceful-first behavior with asynchronous
+   escalation. Windows still falls back to direct termination for the ssh child.
+   That is acceptable for now, but it is not fully equivalent to the POSIX path
+   or to original autossh's TERM-first behavior.
 
 Secondary non-functional follow-up:
 
@@ -180,12 +187,11 @@ Windows primitives instead of pretending `SIGUSR1` exists.
 
 ## Suggested Implementation Order
 
-1. Revisit `AutoSSH::kill_ssh()` and define the desired graceful shutdown policy.
-2. Decide whether restart and stop should share the same escalation path or have
-   slightly different behavior.
-3. Add targeted tests or manual scripts for restart/stop races and child-exit
-   races.
-4. Clean up the Windows fresh-review-build path if reproducible in the next
+1. Add targeted tests or repeatable manual scripts for restart/stop races and
+   child-exit races, especially the new asynchronous shutdown path.
+2. Decide whether Windows should keep direct termination or grow a more native
+   graceful child-stop path.
+3. Clean up the Windows fresh-review-build path if reproducible in the next
    environment.
 
 ## Validation Checklist
@@ -209,6 +215,11 @@ After the next round of work, rerun these checks:
   - `SIGUSR1` triggers a restart
   - `--control restart --pid <pid>` also triggers a restart
   - `SIGTERM` or `--control stop --pid <pid>` shuts the supervisor down
+  - a child that handles `SIGTERM` exits cleanly on restart/stop
+  - a child that ignores `SIGTERM` is force-terminated after the 5 second grace
+    period
+  - a second stop request during the grace period forces fast supervisor exit
+    and removes the pid file
 - Windows:
   - `-f` returns immediately while the detached relaunched supervisor keeps running
   - the detached instance writes the pid file, not the short-lived parent
@@ -228,7 +239,15 @@ After the next round of work, rerun these checks:
   - `-f` returned immediately and left a detached supervisor running
   - `SIGUSR1` restarted the child process
   - `SIGTERM` shut the detached supervisor down and removed the pid file
-- The next session should focus on graceful child shutdown semantics instead of
-  more platform-control plumbing.
+- Additional Linux manual verification completed in this session:
+  - restart/stop requests now begin asynchronous child shutdown without blocking
+    the supervisor event loop
+  - a child that traps `SIGTERM` exits cleanly on restart/stop
+  - a child that ignores `SIGTERM` is force-terminated after the 5 second grace
+    period
+  - a second stop request during the grace period forces quick exit and removes
+    the pid file
+- The next session should focus on Windows shutdown parity and Windows
+  fresh-build validation rather than more POSIX control-path work.
 - Some working trees may still have unrelated local changes in `.gitignore` or
   `CMakeLists.txt`; those were intentionally not part of this functional work.

@@ -31,6 +31,11 @@ private:
         exit_ok,
         exit_error,
     };
+    enum class SshShutdownStage {
+        none,
+        graceful,
+        forced,
+    };
 
     void setup_signals();
     void arm_signal_wait();
@@ -47,8 +52,12 @@ private:
 
     std::vector<std::string> build_ssh_args();
     [[nodiscard]] bool start_ssh();
-    void kill_ssh();
+    void begin_ssh_shutdown();
+    void arm_ssh_shutdown_timer(std::uint64_t shutdown_generation);
+    void force_terminate_ssh();
+    void clear_ssh_shutdown_state();
     bool ssh_running();
+    asio::awaitable<void> wait_for_ssh_shutdown();
 
     asio::awaitable<void> main_loop();
     asio::awaitable<bool> wait_or_ssh_exit(std::chrono::seconds duration);
@@ -69,6 +78,7 @@ private:
     std::optional<bp::process> ssh_;
     std::optional<tcp::acceptor> monitor_acceptor_;
     asio::steady_timer poll_timer_;
+    asio::steady_timer shutdown_timer_;
     asio::signal_set signals_;
 #ifdef _WIN32
     std::optional<asio::windows::object_handle> restart_control_event_;
@@ -80,6 +90,8 @@ private:
     int  exit_code_        = 0;
     bool skip_backoff_once_ = false;
     RequestedAction requested_action_ = RequestedAction::none;
+    SshShutdownStage ssh_shutdown_stage_ = SshShutdownStage::none;
+    std::uint64_t ssh_shutdown_generation_ = 0;
 
     std::chrono::steady_clock::time_point last_attempt_start_;
     std::chrono::steady_clock::time_point daemon_start_;
