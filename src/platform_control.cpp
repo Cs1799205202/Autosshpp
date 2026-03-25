@@ -1,4 +1,4 @@
-#include "platform_control.hpp"
+module;
 
 #include <cerrno>
 #include <cstring>
@@ -12,6 +12,11 @@
 #  include <fcntl.h>
 #  include <unistd.h>
 #endif
+
+module autosshpp.platform_control;
+
+import std;
+import autosshpp.config;
 
 namespace autosshpp {
 
@@ -124,8 +129,8 @@ auto send_control_request(ControlCommand command, int pid)
 
     const auto event_name =
         control_event_name(*action, static_cast<DWORD>(pid));
-    HANDLE event_handle =
-        ::OpenEventW(EVENT_MODIFY_STATE, FALSE, event_name.c_str());
+    auto event_handle = UniqueHandle{
+        ::OpenEventW(EVENT_MODIFY_STATE, FALSE, event_name.c_str())};
     if (!event_handle) {
         const auto error_number = ::GetLastError();
         return std::unexpected(std::format(
@@ -134,16 +139,14 @@ auto send_control_request(ControlCommand command, int pid)
             format_windows_error(error_number)));
     }
 
-    if (!::SetEvent(event_handle)) {
+    if (!::SetEvent(event_handle.get())) {
         const auto error_number = ::GetLastError();
-        ::CloseHandle(event_handle);
         return std::unexpected(std::format(
             "failed to signal control event for pid {}: {}",
             pid,
             format_windows_error(error_number)));
     }
 
-    ::CloseHandle(event_handle);
     return {};
 #else
     auto signal_number = signal_number_for_control_command(command);
@@ -201,8 +204,8 @@ auto detach_into_background(const Config& config)
             format_windows_error(error_number)));
     }
 
-    ::CloseHandle(process_info.hThread);
-    ::CloseHandle(process_info.hProcess);
+    [[maybe_unused]] auto thread_handle = UniqueHandle{process_info.hThread};
+    [[maybe_unused]] auto process_handle = UniqueHandle{process_info.hProcess};
     return true;
 #else
     struct DaemonStatus {
@@ -299,11 +302,11 @@ auto detach_into_background(const Config& config)
 
 #ifdef _WIN32
 auto create_control_event(RequestedAction action, DWORD pid)
-    -> std::expected<HANDLE, std::string>
+    -> std::expected<UniqueHandle, std::string>
 {
     const auto event_name = control_event_name(action, pid);
-    HANDLE event_handle =
-        ::CreateEventW(nullptr, FALSE, FALSE, event_name.c_str());
+    auto event_handle = UniqueHandle{
+        ::CreateEventW(nullptr, FALSE, FALSE, event_name.c_str())};
     if (!event_handle) {
         const auto error_number = ::GetLastError();
         return std::unexpected(std::format(

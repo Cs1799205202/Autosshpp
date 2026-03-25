@@ -85,10 +85,17 @@ add_executable(autossh)
 
 target_compile_definitions(autossh PRIVATE $<$<BOOL:${WIN32}>:_WIN32_WINNT=0x0A01> BOOST_ALL_NO_LIB)
 
-target_sources(autossh PRIVATE
-    src/main.cpp
-    src/autossh.cpp
-    src/platform_control.cpp
+target_sources(autossh
+    PRIVATE
+        src/config.cpp
+        src/main.cpp
+        src/autossh.cpp
+        src/platform_control.cpp
+    PRIVATE
+        FILE_SET cxx_modules TYPE CXX_MODULES FILES
+            src/config.ixx
+            src/platform_control.ixx
+            src/autossh.ixx
 )
 
 target_link_libraries(autossh PRIVATE

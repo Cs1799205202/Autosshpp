@@ -1,4 +1,4 @@
-#pragma once
+module;
 
 #include <boost/asio.hpp>
 #include <boost/process.hpp>
@@ -7,10 +7,13 @@
 #  include <boost/asio/windows/object_handle.hpp>
 #endif
 
-#include "config.hpp"
-#include "platform_control.hpp"
+export module autosshpp.autossh;
 
-namespace autosshpp {
+import std;
+import autosshpp.config;
+import autosshpp.platform_control;
+
+export namespace autosshpp {
 
 namespace asio = boost::asio;
 namespace bp   = boost::process;
@@ -71,7 +74,6 @@ private:
     void write_pid_file();
     void remove_pid_file();
 
-    // ── Members ─────────────────────────────────────────────────────
     asio::io_context& io_;
     Config config_;
 

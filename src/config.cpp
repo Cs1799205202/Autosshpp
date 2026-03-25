@@ -1,81 +1,13 @@
-#pragma once
+module;
 
 #include <argparse/argparse.hpp>
+#include <cstdio>
 
-#include <charconv>
-#include <chrono>
-#include <cstdint>
-#include <cstdlib>
-#include <expected>
-#include <format>
-#include <limits>
-#include <print>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <vector>
+module autosshpp.config;
+
+import std;
 
 namespace autosshpp {
-
-inline constexpr const char* VERSION = "1.0.0";
-inline constexpr int DEFAULT_POLL_TIME = 600;      // seconds
-inline constexpr int DEFAULT_GATE_TIME = 30;       // seconds
-inline constexpr int DEFAULT_NET_TIMEOUT = 15000;  // milliseconds
-inline constexpr int MAX_CONN_TRIES = 3;
-inline constexpr int N_FAST_TRIES = 5;
-inline constexpr std::size_t MAX_MESSAGE_BYTES = 64;
-inline constexpr std::string_view DETACHED_RELAUNCH_MARKER =
-    "--autosshpp-detached";
-
-enum class ControlCommand {
-    none,
-    stop,
-    restart,
-};
-
-struct Config {
-    // Monitor settings
-    uint16_t monitor_port = 0;
-    uint16_t echo_port = 0;
-    bool monitoring_enabled = true;
-
-    // Timing
-    std::chrono::seconds poll_time{DEFAULT_POLL_TIME};
-    std::chrono::seconds first_poll_time{0};  // 0 = same as poll_time
-    std::chrono::seconds gate_time{DEFAULT_GATE_TIME};
-    std::chrono::milliseconds net_timeout{DEFAULT_NET_TIMEOUT};
-    std::chrono::seconds max_lifetime{0};  // 0 = unlimited
-
-    // Limits
-    int max_starts = -1;  // -1 = unlimited
-
-    // Paths & settings
-    std::string ssh_path = "ssh";
-    std::string pid_file;
-    std::string log_file;
-    std::string message;
-    int log_level = -1;  // -1 = not set (use default)
-    bool debug = false;
-
-    // SSH arguments (everything not consumed by autossh)
-    std::vector<std::string> ssh_args;
-
-    // Flags
-    bool run_as_daemon = false;
-    bool detached_relaunch = false;
-    ControlCommand control_command = ControlCommand::none;
-    int control_pid = 0;
-
-    // Derived helpers
-    [[nodiscard]] uint16_t write_port() const { return monitor_port; }
-    [[nodiscard]] uint16_t read_port() const { return monitor_port + 1; }
-
-    [[nodiscard]] std::chrono::seconds effective_first_poll() const {
-        return first_poll_time > std::chrono::seconds{0} ? first_poll_time : poll_time;
-    }
-};
-
-// ── Implementation details ──────────────────────────────────────────
 
 namespace detail {
 
@@ -89,7 +21,7 @@ struct SanitizedArgv {
     bool detached_relaunch = false;
 };
 
-[[nodiscard]] inline auto sanitize_argv(int argc, char* argv[]) -> SanitizedArgv {
+[[nodiscard]] auto sanitize_argv(int argc, char* argv[]) -> SanitizedArgv {
     SanitizedArgv sanitized;
     sanitized.argv.reserve(static_cast<std::size_t>(argc));
 
@@ -107,7 +39,7 @@ struct SanitizedArgv {
     return sanitized;
 }
 
-[[nodiscard]] inline auto parse_control_command(std::string_view text)
+[[nodiscard]] auto parse_control_command(std::string_view text)
     -> std::expected<ControlCommand, std::string>
 {
     if (text == "restart")
@@ -124,23 +56,22 @@ template <typename T>
 [[nodiscard]] auto parse_integer(std::string_view text,
                                  std::string_view label,
                                  T min,
-                                 T max) -> std::expected<T, std::string> {
+                                 T max) -> std::expected<T, std::string>
+{
     static_assert(std::is_integral_v<T>, "parse_integer requires an integral type");
 
     if (text.starts_with('+'))
         text.remove_prefix(1);
 
     if (text.empty())
-        return std::unexpected(
-            std::format("invalid {} \"{}\"", label, text));
+        return std::unexpected(std::format("invalid {} \"{}\"", label, text));
 
     std::int64_t value = 0;
     const auto [ptr, ec] =
         std::from_chars(text.data(), text.data() + text.size(), value);
 
     if (ec != std::errc{} || ptr != text.data() + text.size())
-        return std::unexpected(
-            std::format("invalid {} \"{}\"", label, text));
+        return std::unexpected(std::format("invalid {} \"{}\"", label, text));
 
     if (value < static_cast<std::int64_t>(min) ||
         value > static_cast<std::int64_t>(max))
@@ -156,23 +87,27 @@ template <typename Rep, typename Period>
 [[nodiscard]] auto parse_duration(std::string_view text,
                                   std::string_view label,
                                   Rep min,
-                                  Rep max) -> std::expected<std::chrono::duration<Rep, Period>, std::string> {
+                                  Rep max)
+    -> std::expected<std::chrono::duration<Rep, Period>, std::string>
+{
     auto parsed = parse_integer<Rep>(text, label, min, max);
     if (!parsed)
         return std::unexpected(parsed.error());
     return std::chrono::duration<Rep, Period>{*parsed};
 }
 
-[[nodiscard]] inline auto parse_monitor_spec(std::string_view spec,
-                                             Config& cfg) -> std::expected<void, std::string> {
+[[nodiscard]] auto parse_monitor_spec(std::string_view spec,
+                                      Config& cfg)
+    -> std::expected<void, std::string>
+{
     cfg.monitor_port = 0;
     cfg.echo_port = 0;
     cfg.monitoring_enabled = true;
 
     const auto separator = spec.find(':');
     const auto port_text = spec.substr(0, separator);
-    auto monitor_port =
-        parse_integer<std::uint16_t>(port_text, "monitor port", 0, 65534);
+    auto monitor_port = parse_integer<std::uint16_t>(
+        port_text, "monitor port", 0, 65534);
     if (!monitor_port)
         return std::unexpected(monitor_port.error());
 
@@ -185,8 +120,8 @@ template <typename Rep, typename Period>
     if (separator == std::string_view::npos)
         return {};
 
-    auto echo_port =
-        parse_integer<std::uint16_t>(spec.substr(separator + 1), "echo port", 1, 65535);
+    auto echo_port = parse_integer<std::uint16_t>(
+        spec.substr(separator + 1), "echo port", 1, 65535);
     if (!echo_port)
         return std::unexpected(echo_port.error());
 
@@ -194,23 +129,25 @@ template <typename Rep, typename Period>
     return {};
 }
 
-inline std::optional<std::string> get_env(const char* name) {
+auto get_env(const char* name) -> std::optional<std::string> {
 #ifdef _WIN32
-    char* buf = nullptr;
     std::size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) == 0 && buf) {
-        std::string val(buf);
-        free(buf);
-        return val;
+    auto buf =
+        std::unique_ptr<char, decltype(&std::free)>{nullptr, &std::free};
+    if (_dupenv_s(std::out_ptr(buf), &len, name) == 0 && buf) {
+        return std::string(buf.get());
     }
     return std::nullopt;
 #else
-    if (auto* v = std::getenv(name); v) return std::string(v);
+    if (auto* v = std::getenv(name); v)
+        return std::string(v);
     return std::nullopt;
 #endif
 }
 
-[[nodiscard]] inline auto read_env(Config& cfg) -> std::expected<EnvOverrides, std::string> {
+[[nodiscard]] auto read_env(Config& cfg)
+    -> std::expected<EnvOverrides, std::string>
+{
     constexpr auto max_int = std::numeric_limits<int>::max();
 
     EnvOverrides overrides;
@@ -222,20 +159,23 @@ inline std::optional<std::string> get_env(const char* name) {
         overrides.has_monitor_port = true;
     }
     if (auto v = get_env("AUTOSSH_POLL")) {
-        auto parsed = parse_duration<int, std::ratio<1>>(*v, "poll time", 1, max_int);
+        auto parsed = parse_duration<int, std::ratio<1>>(
+            *v, "poll time", 1, max_int);
         if (!parsed)
             return std::unexpected(parsed.error());
         cfg.poll_time = *parsed;
     }
     if (auto v = get_env("AUTOSSH_FIRST_POLL")) {
-        auto parsed = parse_duration<int, std::ratio<1>>(*v, "first poll time", 1, max_int);
+        auto parsed = parse_duration<int, std::ratio<1>>(
+            *v, "first poll time", 1, max_int);
         if (!parsed)
             return std::unexpected(parsed.error());
         cfg.first_poll_time = *parsed;
         overrides.has_first_poll = true;
     }
     if (auto v = get_env("AUTOSSH_GATETIME")) {
-        auto parsed = parse_duration<int, std::ratio<1>>(*v, "gate time", 0, max_int);
+        auto parsed = parse_duration<int, std::ratio<1>>(
+            *v, "gate time", 0, max_int);
         if (!parsed)
             return std::unexpected(parsed.error());
         cfg.gate_time = *parsed;
@@ -247,7 +187,8 @@ inline std::optional<std::string> get_env(const char* name) {
         cfg.max_starts = *parsed;
     }
     if (auto v = get_env("AUTOSSH_MAXLIFETIME")) {
-        auto parsed = parse_duration<int, std::ratio<1>>(*v, "max lifetime", 0, max_int);
+        auto parsed = parse_duration<int, std::ratio<1>>(
+            *v, "max lifetime", 0, max_int);
         if (!parsed)
             return std::unexpected(parsed.error());
         cfg.max_lifetime = *parsed;
@@ -266,9 +207,9 @@ inline std::optional<std::string> get_env(const char* name) {
     }
     if (auto v = get_env("AUTOSSH_MESSAGE")) {
         if (v->size() > MAX_MESSAGE_BYTES) {
-            return std::unexpected(
-                std::format("echo message may only be {} bytes long",
-                            MAX_MESSAGE_BYTES));
+            return std::unexpected(std::format(
+                "echo message may only be {} bytes long",
+                MAX_MESSAGE_BYTES));
         }
         cfg.message = *v;
     }
@@ -278,7 +219,7 @@ inline std::optional<std::string> get_env(const char* name) {
     return overrides;
 }
 
-inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
+void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
     if (cfg.max_lifetime > std::chrono::seconds{0}) {
         if (cfg.poll_time > cfg.max_lifetime)
             cfg.poll_time = cfg.max_lifetime;
@@ -294,17 +235,14 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
 
 }  // namespace detail
 
-// ── Public parsing entry point ──────────────────────────────────────
-
-[[nodiscard]] inline Config parse_args(int argc, char* argv[]) {
+auto parse_args(int argc, char* argv[]) -> Config {
     using namespace detail;
 
     auto sanitized_argv = sanitize_argv(argc, argv);
     constexpr auto max_int = std::numeric_limits<int>::max();
 
-    // Only auto-add --help; we handle version ourselves via -V.
-    argparse::ArgumentParser program("autossh", VERSION,
-        argparse::default_arguments::help);
+    argparse::ArgumentParser program(
+        "autossh", VERSION, argparse::default_arguments::help);
     program.add_description(
         "Automatically restart SSH sessions and tunnels.\n"
         "All unrecognized options are forwarded to ssh.");
@@ -329,7 +267,6 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
         .help("target autossh process id for --control")
         .metavar("PID");
 
-    // Stringifies the argparse help (argparse only supports ostream).
     auto help = [&] {
         std::ostringstream oss;
         oss << program;
@@ -340,7 +277,6 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
         std::exit(1);
     };
 
-    // parse_known_args lets unknown SSH flags (-o, -p, etc.) pass through.
     std::vector<std::string> unrecognized;
     try {
         unrecognized = program.parse_known_args(
@@ -372,8 +308,8 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
         if (!control_command)
             fail(control_command.error());
 
-        auto control_pid = parse_integer<int>(
-            program.get("--pid"), "control pid", 1, max_int);
+        auto control_pid =
+            parse_integer<int>(program.get("--pid"), "control pid", 1, max_int);
         if (!control_pid)
             fail(control_pid.error());
 
@@ -389,7 +325,6 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
     if (!env_overrides)
         fail(env_overrides.error());
 
-    // -M: env var AUTOSSH_PORT takes precedence.
     bool have_port = env_overrides->has_monitor_port;
     if (!have_port && program.is_used("-M")) {
         auto parsed = parse_monitor_spec(program.get("-M"), cfg);
@@ -409,7 +344,6 @@ inline void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
     if (cfg.ssh_args.empty())
         fail("no ssh arguments specified");
 
-    // Daemon mode disables gate-time (always retry)
     if (cfg.run_as_daemon)
         cfg.gate_time = std::chrono::seconds{0};
 

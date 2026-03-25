@@ -1,5 +1,7 @@
-#include "autossh.hpp"
+module;
 
+#include <boost/asio.hpp>
+#include <boost/process.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -16,7 +18,11 @@
 #  include <unistd.h>    // getpid
 #endif
 
+module autosshpp.autossh;
+
 import std;
+import autosshpp.config;
+import autosshpp.platform_control;
 
 namespace autosshpp {
 
@@ -144,13 +150,11 @@ auto AutoSSH::setup_platform_control() -> std::expected<void, std::string> {
         return std::unexpected(restart_event.error());
 
     auto stop_event = create_control_event(RequestedAction::stop, pid);
-    if (!stop_event) {
-        ::CloseHandle(*restart_event);
+    if (!stop_event)
         return std::unexpected(stop_event.error());
-    }
 
-    restart_control_event_.emplace(io_, *restart_event);
-    stop_control_event_.emplace(io_, *stop_event);
+    restart_control_event_.emplace(io_, restart_event->release());
+    stop_control_event_.emplace(io_, stop_event->release());
 
     arm_platform_control_wait(*restart_control_event_, RequestedAction::restart);
     arm_platform_control_wait(*stop_control_event_, RequestedAction::stop);
