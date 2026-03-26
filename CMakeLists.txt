@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_MODULE_STD ON)
 
+find_program(MOLD_EXECUTABLE NAMES mold)
+if(MOLD_EXECUTABLE)
+    set(CMAKE_LINKER_TYPE MOLD)
+endif()
+
 # Set experimental flag to enable `import std` support from CMake. This must be
 # enabled before C++ language support.
 set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
@@ -14,6 +19,8 @@ set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
     "d0edc3af-4c50-42ea-a356-e2862fe7a444")
 
 project(autosshpp LANGUAGES CXX)
+
+include(CTest)
 
 add_compile_options("$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/utf-8;/Zc:__cplusplus;/Zc:preprocessor>")
 
@@ -93,6 +100,7 @@ target_sources(autossh
         src/platform_control.cpp
     PRIVATE
         FILE_SET cxx_modules TYPE CXX_MODULES FILES
+            src/common.ixx
             src/config.ixx
             src/platform_control.ixx
             src/autossh.ixx
@@ -103,5 +111,16 @@ target_link_libraries(autossh PRIVATE
     spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>
     Boost::asio Boost::process
 )
+
+
+if(BUILD_TESTING)
+    add_test(NAME autossh_version COMMAND autossh -V)
+    set_tests_properties(autossh_version PROPERTIES
+        PASS_REGULAR_EXPRESSION "autossh\\+\\+ 1\\.0\\.0")
+
+    add_test(NAME autossh_help COMMAND autossh --help)
+    set_tests_properties(autossh_help PROPERTIES
+        PASS_REGULAR_EXPRESSION "Usage: autossh")
+endif()
 
 # cmake -DCMAKE_BUILD_TYPE:STRING=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE -DCMAKE_C_COMPILER:FILEPATH=/usr/bin/clang-20 -DCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++-20 --no-warn-unused-cli -S /root/projects/Autosshpp -B /root/projects/Autosshpp/build -G Ninja -DBOOST_PROCESS_USE_STD_FS=ON -DCMAKE_CXX_FLAGS=-stdlib=libc++

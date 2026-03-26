@@ -6,6 +6,7 @@ module;
 module autosshpp.config;
 
 import std;
+import autosshpp.common;
 
 namespace autosshpp {
 
@@ -40,44 +41,53 @@ struct SanitizedArgv {
 }
 
 [[nodiscard]] auto parse_control_command(std::string_view text)
-    -> std::expected<ControlCommand, std::string>
+    -> Result<ControlCommand>
 {
     if (text == "restart")
         return ControlCommand::restart;
     if (text == "stop")
         return ControlCommand::stop;
 
-    return std::unexpected(std::format(
-        "unsupported control action \"{}\" (expected restart or stop)",
-        text));
+    return std::unexpected(make_error(
+        ErrorCode::unsupported_operation,
+        std::format(
+            "unsupported control action \"{}\" (expected restart or stop)",
+            text)));
 }
 
 template <typename T>
 [[nodiscard]] auto parse_integer(std::string_view text,
                                  std::string_view label,
                                  T min,
-                                 T max) -> std::expected<T, std::string>
+                                 T max) -> Result<T>
 {
     static_assert(std::is_integral_v<T>, "parse_integer requires an integral type");
 
     if (text.starts_with('+'))
         text.remove_prefix(1);
 
-    if (text.empty())
-        return std::unexpected(std::format("invalid {} \"{}\"", label, text));
+    if (text.empty()) {
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            std::format("invalid {} \"{}\"", label, text)));
+    }
 
     std::int64_t value = 0;
     const auto [ptr, ec] =
         std::from_chars(text.data(), text.data() + text.size(), value);
 
-    if (ec != std::errc{} || ptr != text.data() + text.size())
-        return std::unexpected(std::format("invalid {} \"{}\"", label, text));
+    if (ec != std::errc{} || ptr != text.data() + text.size()) {
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            std::format("invalid {} \"{}\"", label, text)));
+    }
 
     if (value < static_cast<std::int64_t>(min) ||
         value > static_cast<std::int64_t>(max))
     {
-        return std::unexpected(
-            std::format("{} ({}) out of range", label, value));
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            std::format("{} ({}) out of range", label, value)));
     }
 
     return static_cast<T>(value);
@@ -88,7 +98,7 @@ template <typename Rep, typename Period>
                                   std::string_view label,
                                   Rep min,
                                   Rep max)
-    -> std::expected<std::chrono::duration<Rep, Period>, std::string>
+    -> Result<std::chrono::duration<Rep, Period>>
 {
     auto parsed = parse_integer<Rep>(text, label, min, max);
     if (!parsed)
@@ -97,8 +107,7 @@ template <typename Rep, typename Period>
 }
 
 [[nodiscard]] auto parse_monitor_spec(std::string_view spec,
-                                      Config& cfg)
-    -> std::expected<void, std::string>
+                                      Config& cfg) -> Result<void>
 {
     cfg.monitor_port = 0;
     cfg.echo_port = 0;
@@ -145,9 +154,7 @@ auto get_env(const char* name) -> std::optional<std::string> {
 #endif
 }
 
-[[nodiscard]] auto read_env(Config& cfg)
-    -> std::expected<EnvOverrides, std::string>
-{
+[[nodiscard]] auto read_env(Config& cfg) -> Result<EnvOverrides> {
     constexpr auto max_int = std::numeric_limits<int>::max();
 
     EnvOverrides overrides;
@@ -207,9 +214,11 @@ auto get_env(const char* name) -> std::optional<std::string> {
     }
     if (auto v = get_env("AUTOSSH_MESSAGE")) {
         if (v->size() > MAX_MESSAGE_BYTES) {
-            return std::unexpected(std::format(
-                "echo message may only be {} bytes long",
-                MAX_MESSAGE_BYTES));
+            return std::unexpected(make_error(
+                ErrorCode::invalid_argument,
+                std::format(
+                    "echo message may only be {} bytes long",
+                    MAX_MESSAGE_BYTES)));
         }
         cfg.message = *v;
     }
@@ -235,34 +244,33 @@ void normalize_timings(Config& cfg, bool has_explicit_first_poll) {
 
 }  // namespace detail
 
-auto parse_args(int argc, char* argv[]) -> Config {
+auto parse_args(int argc, char* argv[]) -> Result<ParsedCommand> {
     using namespace detail;
 
     auto sanitized_argv = sanitize_argv(argc, argv);
     constexpr auto max_int = std::numeric_limits<int>::max();
 
     argparse::ArgumentParser program(
-        "autossh", VERSION, argparse::default_arguments::help);
+        "autossh", VERSION, argparse::default_arguments::none);
     program.add_description(
         "Automatically restart SSH sessions and tunnels.\n"
         "All unrecognized options are forwarded to ssh.");
 
+    program.add_argument("-h", "--help")
+        .help("show this help message and exit")
+        .flag();
     program.add_argument("-V")
         .help("print version and exit")
         .flag();
-
     program.add_argument("-M")
         .help("monitor port[:echo_port] (0 to disable)")
         .metavar("PORT");
-
     program.add_argument("-f")
         .help("run in background (daemon mode)")
         .flag();
-
     program.add_argument("--control")
         .help("send a control action to a running autossh instance")
         .metavar("ACTION");
-
     program.add_argument("--pid")
         .help("target autossh process id for --control")
         .metavar("PID");
@@ -272,9 +280,9 @@ auto parse_args(int argc, char* argv[]) -> Config {
         oss << program;
         return std::move(oss).str();
     };
-    auto fail = [&](std::string_view message) {
-        std::println(stderr, "error: {}\n\n{}", message, help());
-        std::exit(1);
+    auto fail = [&](ErrorCode code,
+                    std::string message) -> Result<ParsedCommand> {
+        return std::unexpected(make_error(code, std::move(message), help()));
     };
 
     std::vector<std::string> unrecognized;
@@ -283,58 +291,73 @@ auto parse_args(int argc, char* argv[]) -> Config {
             static_cast<int>(sanitized_argv.argv.size()),
             sanitized_argv.argv.data());
     } catch (const std::exception& e) {
-        fail(e.what());
+        return fail(ErrorCode::invalid_argument, e.what());
     }
+
+    if (program.get<bool>("--help"))
+        return PrintCommand{.text = help()};
 
     if (program.get<bool>("-V")) {
-        std::println("autossh++ {}", VERSION);
-        std::exit(0);
+        return PrintCommand{
+            .text = std::format("autossh++ {}", VERSION),
+        };
     }
-
-    Config cfg;
-    cfg.detached_relaunch = sanitized_argv.detached_relaunch;
 
     if (program.is_used("--control")) {
         if (program.is_used("-M"))
-            fail("-M cannot be used with --control");
+            return fail(
+                ErrorCode::invalid_argument,
+                "-M cannot be used with --control");
         if (program.get<bool>("-f"))
-            fail("-f cannot be used with --control");
-        if (!unrecognized.empty())
-            fail("control mode does not accept ssh arguments");
-        if (!program.is_used("--pid"))
-            fail("--pid is required with --control");
+            return fail(
+                ErrorCode::invalid_argument,
+                "-f cannot be used with --control");
+        if (!unrecognized.empty()) {
+            return fail(
+                ErrorCode::invalid_argument,
+                "control mode does not accept ssh arguments");
+        }
+        if (!program.is_used("--pid")) {
+            return fail(
+                ErrorCode::missing_argument,
+                "--pid is required with --control");
+        }
 
         auto control_command = parse_control_command(program.get("--control"));
         if (!control_command)
-            fail(control_command.error());
+            return std::unexpected(control_command.error());
 
         auto control_pid =
             parse_integer<int>(program.get("--pid"), "control pid", 1, max_int);
         if (!control_pid)
-            fail(control_pid.error());
+            return std::unexpected(control_pid.error());
 
-        cfg.control_command = *control_command;
-        cfg.control_pid = *control_pid;
-        return cfg;
+        return ControlRequest{
+            .command = *control_command,
+            .pid = *control_pid,
+        };
     }
 
     if (program.is_used("--pid"))
-        fail("--pid requires --control");
+        return fail(ErrorCode::invalid_argument, "--pid requires --control");
+
+    Config cfg;
+    cfg.detached_relaunch = sanitized_argv.detached_relaunch;
 
     auto env_overrides = read_env(cfg);
     if (!env_overrides)
-        fail(env_overrides.error());
+        return std::unexpected(env_overrides.error());
 
     bool have_port = env_overrides->has_monitor_port;
     if (!have_port && program.is_used("-M")) {
         auto parsed = parse_monitor_spec(program.get("-M"), cfg);
         if (!parsed)
-            fail(parsed.error());
+            return std::unexpected(parsed.error());
         have_port = true;
     }
 
     if (!have_port)
-        fail("-M option is required");
+        return fail(ErrorCode::missing_argument, "-M option is required");
 
     if (program.get<bool>("-f"))
         cfg.run_as_daemon = true;
@@ -342,14 +365,16 @@ auto parse_args(int argc, char* argv[]) -> Config {
     cfg.ssh_args = std::move(unrecognized);
 
     if (cfg.ssh_args.empty())
-        fail("no ssh arguments specified");
+        return fail(
+            ErrorCode::missing_argument,
+            "no ssh arguments specified");
 
     if (cfg.run_as_daemon)
         cfg.gate_time = std::chrono::seconds{0};
 
     normalize_timings(cfg, env_overrides->has_first_poll);
 
-    return cfg;
+    return RunCommand{.config = std::move(cfg)};
 }
 
 }  // namespace autosshpp

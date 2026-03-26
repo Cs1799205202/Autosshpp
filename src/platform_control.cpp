@@ -19,6 +19,7 @@ module;
 module autosshpp.platform_control;
 
 import std;
+import autosshpp.common;
 import autosshpp.config;
 
 namespace autosshpp {
@@ -29,6 +30,15 @@ namespace {
 
 [[nodiscard]] auto format_windows_error(DWORD error_number) -> std::string {
     return std::system_category().message(static_cast<int>(error_number));
+}
+
+[[nodiscard]] auto make_windows_error(ErrorCode code,
+                                      std::string message,
+                                      DWORD error_number) -> Error
+{
+    return make_error(
+        code,
+        std::format("{}: {}", std::move(message), format_windows_error(error_number)));
 }
 
 class ScopedCtrlHandlerIgnore {
@@ -59,14 +69,13 @@ public:
         reset();
     }
 
-    [[nodiscard]] static auto create()
-        -> std::expected<ScopedCtrlHandlerIgnore, std::string>
-    {
+    [[nodiscard]] static auto create() -> Result<ScopedCtrlHandlerIgnore> {
         if (!::SetConsoleCtrlHandler(nullptr, TRUE)) {
             const auto error_number = ::GetLastError();
-            return std::unexpected(std::format(
-                "failed to ignore console control events temporarily: {}",
-                format_windows_error(error_number)));
+            return std::unexpected(make_windows_error(
+                ErrorCode::platform_failure,
+                "failed to ignore console control events temporarily",
+                error_number));
         }
 
         ScopedCtrlHandlerIgnore guard;
@@ -121,16 +130,17 @@ public:
     }
 
     [[nodiscard]] static auto attach_to_process_console(DWORD pid)
-        -> std::expected<ScopedConsoleAttachment, std::string>
+        -> Result<ScopedConsoleAttachment>
     {
         ScopedConsoleAttachment attachment;
 
         if (::GetConsoleWindow() != nullptr) {
             if (!::FreeConsole()) {
                 const auto error_number = ::GetLastError();
-                return std::unexpected(std::format(
-                    "failed to detach from current console: {}",
-                    format_windows_error(error_number)));
+                return std::unexpected(make_windows_error(
+                    ErrorCode::platform_failure,
+                    "failed to detach from current console",
+                    error_number));
             }
             attachment.detached_existing_console_ = true;
         }
@@ -139,10 +149,10 @@ public:
             const auto error_number = ::GetLastError();
             if (attachment.detached_existing_console_)
                 attachment.reattach_parent_console();
-            return std::unexpected(std::format(
-                "failed to attach to child console for pid {}: {}",
-                pid,
-                format_windows_error(error_number)));
+            return std::unexpected(make_windows_error(
+                ErrorCode::platform_failure,
+                std::format("failed to attach to child console for pid {}", pid),
+                error_number));
         }
 
         attachment.attached_target_console_ = true;
@@ -193,28 +203,42 @@ private:
 
 #endif
 
+[[nodiscard]] auto make_errno_error(ErrorCode code,
+                                    std::string message,
+                                    int error_number = errno) -> Error
+{
+    return make_error(
+        code,
+        std::format("{}: {}", std::move(message), std::strerror(error_number)));
+}
+
 [[nodiscard]] auto signal_number_for_control_command(ControlCommand command)
-    -> std::expected<int, std::string>
+    -> Result<int>
 {
     switch (command) {
     case ControlCommand::restart:
 #if defined(SIGUSR1) && !defined(_WIN32)
         return SIGUSR1;
 #else
-        return std::unexpected(
-            "restart control is not available on this platform");
+        return std::unexpected(make_error(
+            ErrorCode::unsupported_operation,
+            "restart control is not available on this platform"));
 #endif
     case ControlCommand::stop:
         return SIGTERM;
     case ControlCommand::none:
-        return std::unexpected("no control action requested");
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            "no control action requested"));
     }
 
-    return std::unexpected("unknown control action");
+    return std::unexpected(make_error(
+        ErrorCode::internal_failure,
+        "unknown control action"));
 }
 
 [[nodiscard]] auto requested_action_for_control_command(ControlCommand command)
-    -> std::expected<RequestedAction, std::string>
+    -> Result<RequestedAction>
 {
     switch (command) {
     case ControlCommand::restart:
@@ -222,10 +246,14 @@ private:
     case ControlCommand::stop:
         return RequestedAction::stop;
     case ControlCommand::none:
-        return std::unexpected("no control action requested");
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            "no control action requested"));
     }
 
-    return std::unexpected("unknown control action");
+    return std::unexpected(make_error(
+        ErrorCode::internal_failure,
+        "unknown control action"));
 }
 
 }  // namespace
@@ -257,59 +285,55 @@ auto requested_action_for_signal(int signal_number) -> RequestedAction {
     }
 }
 
-auto send_control_request(ControlCommand command, int pid)
-    -> std::expected<void, std::string>
-{
-    if (pid <= 0) {
-        return std::unexpected(std::format(
-            "control pid ({}) must be positive", pid));
+auto send_control_request(const ControlRequest& request) -> Result<void> {
+    if (request.pid <= 0) {
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            std::format("control pid ({}) must be positive", request.pid)));
     }
 
 #ifdef _WIN32
-    auto action = requested_action_for_control_command(command);
+    auto action = requested_action_for_control_command(request.command);
     if (!action)
         return std::unexpected(action.error());
 
     const auto event_name =
-        control_event_name(*action, static_cast<DWORD>(pid));
+        control_event_name(*action, static_cast<DWORD>(request.pid));
     auto event_handle = UniqueHandle{
         ::OpenEventW(EVENT_MODIFY_STATE, FALSE, event_name.c_str())};
     if (!event_handle) {
         const auto error_number = ::GetLastError();
-        return std::unexpected(std::format(
-            "failed to open control event for pid {}: {}",
-            pid,
-            format_windows_error(error_number)));
+        return std::unexpected(make_windows_error(
+            ErrorCode::platform_failure,
+            std::format("failed to open control event for pid {}", request.pid),
+            error_number));
     }
 
     if (!::SetEvent(event_handle.get())) {
         const auto error_number = ::GetLastError();
-        return std::unexpected(std::format(
-            "failed to signal control event for pid {}: {}",
-            pid,
-            format_windows_error(error_number)));
+        return std::unexpected(make_windows_error(
+            ErrorCode::platform_failure,
+            std::format("failed to signal control event for pid {}", request.pid),
+            error_number));
     }
 
     return {};
 #else
-    auto signal_number = signal_number_for_control_command(command);
+    auto signal_number = signal_number_for_control_command(request.command);
     if (!signal_number)
         return std::unexpected(signal_number.error());
 
-    if (::kill(pid, *signal_number) != 0) {
-        return std::unexpected(std::format(
-            "failed to send control signal to pid {}: {}",
-            pid,
-            std::strerror(errno)));
+    if (::kill(request.pid, *signal_number) != 0) {
+        return std::unexpected(make_errno_error(
+            ErrorCode::platform_failure,
+            std::format("failed to send control signal to pid {}", request.pid)));
     }
 
     return {};
 #endif
 }
 
-auto detach_into_background(const Config& config)
-    -> std::expected<bool, std::string>
-{
+auto detach_into_background(const Config& config) -> Result<bool> {
     if (!config.run_as_daemon)
         return false;
 
@@ -342,9 +366,10 @@ auto detach_into_background(const Config& config)
                           &process_info))
     {
         const auto error_number = ::GetLastError();
-        return std::unexpected(std::format(
-            "failed to relaunch detached background process for -f: {}",
-            format_windows_error(error_number)));
+        return std::unexpected(make_windows_error(
+            ErrorCode::platform_failure,
+            "failed to relaunch detached background process for -f",
+            error_number));
     }
 
     [[maybe_unused]] auto thread_handle = UniqueHandle{process_info.hThread};
@@ -358,8 +383,9 @@ auto detach_into_background(const Config& config)
 
     int status_pipe[2] = {-1, -1};
     if (::pipe(status_pipe) != 0) {
-        return std::unexpected(std::format(
-            "failed to create daemon status pipe: {}", std::strerror(errno)));
+        return std::unexpected(make_errno_error(
+            ErrorCode::platform_failure,
+            "failed to create daemon status pipe"));
     }
 
     const pid_t pid = ::fork();
@@ -367,8 +393,10 @@ auto detach_into_background(const Config& config)
         const auto error_number = errno;
         ::close(status_pipe[0]);
         ::close(status_pipe[1]);
-        return std::unexpected(std::format(
-            "failed to fork for -f: {}", std::strerror(error_number)));
+        return std::unexpected(make_errno_error(
+            ErrorCode::platform_failure,
+            "failed to fork for -f",
+            error_number));
     }
 
     if (pid > 0) {
@@ -383,17 +411,20 @@ auto detach_into_background(const Config& config)
         ::close(status_pipe[0]);
 
         if (bytes_read == 0) {
-            return std::unexpected(
-                "detached child exited before reporting startup status");
+            return std::unexpected(make_error(
+                ErrorCode::platform_failure,
+                "detached child exited before reporting startup status"));
         }
         if (bytes_read != static_cast<ssize_t>(sizeof(status))) {
-            return std::unexpected(
-                "detached child reported an invalid startup status");
+            return std::unexpected(make_error(
+                ErrorCode::platform_failure,
+                "detached child reported an invalid startup status"));
         }
         if (!status.success) {
-            return std::unexpected(std::format(
-                "failed to enter background mode: {}",
-                std::strerror(status.error_number)));
+            return std::unexpected(make_errno_error(
+                ErrorCode::platform_failure,
+                "failed to enter background mode",
+                status.error_number));
         }
 
         return true;
@@ -445,27 +476,27 @@ auto detach_into_background(const Config& config)
 
 #ifdef _WIN32
 auto create_control_event(RequestedAction action, DWORD pid)
-    -> std::expected<UniqueHandle, std::string>
+    -> Result<UniqueHandle>
 {
     const auto event_name = control_event_name(action, pid);
     auto event_handle = UniqueHandle{
         ::CreateEventW(nullptr, FALSE, FALSE, event_name.c_str())};
     if (!event_handle) {
         const auto error_number = ::GetLastError();
-        return std::unexpected(std::format(
-            "failed to create control event for pid {}: {}",
-            pid,
-            format_windows_error(error_number)));
+        return std::unexpected(make_windows_error(
+            ErrorCode::platform_failure,
+            std::format("failed to create control event for pid {}", pid),
+            error_number));
     }
 
     return event_handle;
 }
 
-auto request_process_group_interrupt(DWORD pid)
-    -> std::expected<void, std::string>
-{
+auto request_process_group_interrupt(DWORD pid) -> Result<void> {
     if (pid == 0) {
-        return std::unexpected("child pid must be non-zero");
+        return std::unexpected(make_error(
+            ErrorCode::invalid_argument,
+            "child pid must be non-zero"));
     }
 
     auto ignored_ctrl_handler = ScopedCtrlHandlerIgnore::create();
@@ -478,20 +509,22 @@ auto request_process_group_interrupt(DWORD pid)
     const auto direct_error = ::GetLastError();
     auto console_attachment = ScopedConsoleAttachment::attach_to_process_console(pid);
     if (!console_attachment) {
-        return std::unexpected(std::format(
-            "failed to request graceful console shutdown for pid {}: {}; "
-            "attach fallback failed: {}",
-            pid,
-            format_windows_error(direct_error),
-            console_attachment.error()));
+        return std::unexpected(make_error(
+            ErrorCode::platform_failure,
+            std::format(
+                "failed to request graceful console shutdown for pid {}: {}; "
+                "attach fallback failed: {}",
+                pid,
+                format_windows_error(direct_error),
+                console_attachment.error().message)));
     }
 
     if (!::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)) {
         const auto attached_error = ::GetLastError();
-        return std::unexpected(std::format(
-            "failed to request graceful console shutdown for pid {}: {}",
-            pid,
-            format_windows_error(attached_error)));
+        return std::unexpected(make_windows_error(
+            ErrorCode::platform_failure,
+            std::format("failed to request graceful console shutdown for pid {}", pid),
+            attached_error));
     }
 
     return {};

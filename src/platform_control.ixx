@@ -10,6 +10,7 @@ module;
 export module autosshpp.platform_control;
 
 import std;
+import autosshpp.common;
 import autosshpp.config;
 
 export namespace autosshpp {
@@ -23,10 +24,10 @@ enum class RequestedAction {
 [[nodiscard]] auto platform_control_signals() -> std::span<const int>;
 [[nodiscard]] auto requested_action_for_signal(int signal_number)
     -> RequestedAction;
-[[nodiscard]] auto send_control_request(ControlCommand command, int pid)
-    -> std::expected<void, std::string>;
+[[nodiscard]] auto send_control_request(const ControlRequest& request)
+    -> Result<void>;
 [[nodiscard]] auto detach_into_background(const Config& config)
-    -> std::expected<bool, std::string>;
+    -> Result<bool>;
 
 #ifdef _WIN32
 struct UniqueHandleCloser {
@@ -42,9 +43,9 @@ using UniqueHandle =
     std::unique_ptr<std::remove_pointer_t<HANDLE>, UniqueHandleCloser>;
 
 [[nodiscard]] auto create_control_event(RequestedAction action, DWORD pid)
-    -> std::expected<UniqueHandle, std::string>;
+    -> Result<UniqueHandle>;
 [[nodiscard]] auto request_process_group_interrupt(DWORD pid)
-    -> std::expected<void, std::string>;
+    -> Result<void>;
 #endif
 
 }  // namespace autosshpp

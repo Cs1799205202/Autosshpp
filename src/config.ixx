@@ -1,6 +1,7 @@
 export module autosshpp.config;
 
 import std;
+import autosshpp.common;
 
 export namespace autosshpp {
 
@@ -18,6 +19,11 @@ enum class ControlCommand {
     none,
     stop,
     restart,
+};
+
+struct ControlRequest {
+    ControlCommand command = ControlCommand::none;
+    int pid = 0;
 };
 
 struct Config {
@@ -44,8 +50,6 @@ struct Config {
 
     bool run_as_daemon = false;
     bool detached_relaunch = false;
-    ControlCommand control_command = ControlCommand::none;
-    int control_pid = 0;
 
     [[nodiscard]] auto write_port() const -> std::uint16_t {
         return monitor_port;
@@ -62,6 +66,16 @@ struct Config {
     }
 };
 
-[[nodiscard]] auto parse_args(int argc, char* argv[]) -> Config;
+struct PrintCommand {
+    std::string text;
+};
+
+struct RunCommand {
+    Config config;
+};
+
+using ParsedCommand = std::variant<PrintCommand, ControlRequest, RunCommand>;
+
+[[nodiscard]] auto parse_args(int argc, char* argv[]) -> Result<ParsedCommand>;
 
 }  // namespace autosshpp
