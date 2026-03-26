@@ -43,6 +43,8 @@ using UniqueHandle =
 
 [[nodiscard]] auto create_control_event(RequestedAction action, DWORD pid)
     -> std::expected<UniqueHandle, std::string>;
+[[nodiscard]] auto request_process_group_interrupt(DWORD pid)
+    -> std::expected<void, std::string>;
 #endif
 
 }  // namespace autosshpp

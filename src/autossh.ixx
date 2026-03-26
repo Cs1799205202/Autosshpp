@@ -18,6 +18,21 @@ export namespace autosshpp {
 namespace asio = boost::asio;
 namespace bp   = boost::process;
 using tcp      = asio::ip::tcp;
+using IoExecutor = asio::io_context::executor_type;
+using Process = bp::basic_process<IoExecutor>;
+using Timer = asio::basic_waitable_timer<std::chrono::steady_clock,
+                                         asio::wait_traits<std::chrono::steady_clock>,
+                                         IoExecutor>;
+using Socket = asio::basic_stream_socket<tcp, IoExecutor>;
+using Acceptor = asio::basic_socket_acceptor<tcp, IoExecutor>;
+using SignalSet = asio::basic_signal_set<IoExecutor>;
+
+template <typename T>
+using IoAwaitable = asio::awaitable<T, IoExecutor>;
+
+#ifdef _WIN32
+using ObjectHandle = asio::windows::basic_object_handle<IoExecutor>;
+#endif
 
 class AutoSSH {
 public:
@@ -45,8 +60,7 @@ private:
     void arm_force_exit_wait();
     [[nodiscard]] auto setup_platform_control() -> std::expected<void, std::string>;
 #ifdef _WIN32
-    void arm_platform_control_wait(asio::windows::object_handle& handle,
-                                   RequestedAction action);
+    void arm_platform_control_wait(ObjectHandle& handle, RequestedAction action);
 #endif
     void setup_monitor_listener();
     void request_action(RequestedAction action);
@@ -60,12 +74,12 @@ private:
     void force_terminate_ssh();
     void clear_ssh_shutdown_state();
     bool ssh_running();
-    asio::awaitable<void> wait_for_ssh_shutdown();
+    IoAwaitable<void> wait_for_ssh_shutdown();
 
-    asio::awaitable<void> main_loop();
-    asio::awaitable<bool> wait_or_ssh_exit(std::chrono::seconds duration);
-    asio::awaitable<bool> test_connection();
-    asio::awaitable<bool> test_connection_once();
+    IoAwaitable<void> main_loop();
+    IoAwaitable<bool> wait_or_ssh_exit(std::chrono::seconds duration);
+    IoAwaitable<bool> test_connection();
+    IoAwaitable<bool> test_connection_once();
 
     RestartAction classify_exit(int exit_code, bool first_attempt);
     std::chrono::seconds calculate_backoff();
@@ -77,14 +91,14 @@ private:
     asio::io_context& io_;
     Config config_;
 
-    std::optional<bp::process> ssh_;
-    std::optional<tcp::acceptor> monitor_acceptor_;
-    asio::steady_timer poll_timer_;
-    asio::steady_timer shutdown_timer_;
-    asio::signal_set signals_;
+    std::optional<Process> ssh_;
+    std::optional<Acceptor> monitor_acceptor_;
+    Timer poll_timer_;
+    Timer shutdown_timer_;
+    SignalSet signals_;
 #ifdef _WIN32
-    std::optional<asio::windows::object_handle> restart_control_event_;
-    std::optional<asio::windows::object_handle> stop_control_event_;
+    std::optional<ObjectHandle> restart_control_event_;
+    std::optional<ObjectHandle> stop_control_event_;
 #endif
 
     int  start_count_      = 0;

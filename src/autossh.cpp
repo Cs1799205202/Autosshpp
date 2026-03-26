@@ -2,6 +2,9 @@ module;
 
 #include <boost/asio.hpp>
 #include <boost/process.hpp>
+#ifdef _WIN32
+#  include <boost/process/v2/windows/creation_flags.hpp>
+#endif
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -164,7 +167,7 @@ auto AutoSSH::setup_platform_control() -> std::expected<void, std::string> {
 }
 
 #ifdef _WIN32
-void AutoSSH::arm_platform_control_wait(asio::windows::object_handle& handle,
+void AutoSSH::arm_platform_control_wait(ObjectHandle& handle,
                                         RequestedAction action) {
     handle.async_wait([this, &handle, action](error_code ec) {
         if (ec)
@@ -294,8 +297,16 @@ bool AutoSSH::start_ssh() {
             }
         }
 
-        // Boost.Process v2: process(executor, path, args)
+        // Launch ssh in its own process group so Windows can send a
+        // targeted console control event for graceful shutdown.
+#ifdef _WIN32
+        ssh_.emplace(io_.get_executor(),
+                     exe,
+                     args,
+                     bp::windows::create_new_process_group);
+#else
         ssh_.emplace(io_.get_executor(), exe, args);
+#endif
         clear_ssh_shutdown_state();
         ssh_start_ = last_attempt_start_;
         return true;
@@ -337,6 +348,19 @@ void AutoSSH::begin_ssh_shutdown() {
         return;
 
     spdlog::warn("failed to request graceful ssh shutdown: {}", ec.message());
+#else
+    auto graceful_shutdown =
+        request_process_group_interrupt(static_cast<DWORD>(ssh_->id()));
+    if (graceful_shutdown) {
+        ssh_shutdown_stage_ = SshShutdownStage::graceful;
+        ++ssh_shutdown_generation_;
+        spdlog::info("requested graceful ssh shutdown");
+        arm_ssh_shutdown_timer(ssh_shutdown_generation_);
+        return;
+    }
+
+    spdlog::warn("failed to request graceful ssh shutdown: {}",
+                 graceful_shutdown.error());
 #endif
 
     force_terminate_ssh();
@@ -413,7 +437,7 @@ bool AutoSSH::ssh_running() {
     }
 }
 
-asio::awaitable<void> AutoSSH::wait_for_ssh_shutdown() {
+IoAwaitable<void> AutoSSH::wait_for_ssh_shutdown() {
     if (!ssh_) {
         clear_ssh_shutdown_state();
         co_return;
@@ -424,7 +448,7 @@ asio::awaitable<void> AutoSSH::wait_for_ssh_shutdown() {
     while (ssh_running()) {
         poll_timer_.expires_after(SSH_SHUTDOWN_POLL_INTERVAL);
         co_await poll_timer_.async_wait(
-            asio::as_tuple(asio::use_awaitable));
+            asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
     }
 
     clear_ssh_shutdown_state();
@@ -434,7 +458,7 @@ asio::awaitable<void> AutoSSH::wait_for_ssh_shutdown() {
 //  Main coroutine loop
 // ════════════════════════════════════════════════════════════════════
 
-asio::awaitable<void> AutoSSH::main_loop() {
+IoAwaitable<void> AutoSSH::main_loop() {
     daemon_start_ = std::chrono::steady_clock::now();
 
     spdlog::info("autossh++ {} starting", VERSION);
@@ -453,7 +477,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
             spdlog::info("backoff: waiting {}s before restart", backoff.count());
             poll_timer_.expires_after(backoff);
             auto [ec] = co_await poll_timer_.async_wait(
-                asio::as_tuple(asio::use_awaitable));
+                asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
             if (stop_requested())
                 break;
         }
@@ -571,7 +595,7 @@ asio::awaitable<void> AutoSSH::main_loop() {
 //  Polling / waiting
 // ════════════════════════════════════════════════════════════════════
 
-asio::awaitable<bool>
+IoAwaitable<bool>
 AutoSSH::wait_or_ssh_exit(std::chrono::seconds duration) {
     auto deadline = std::chrono::steady_clock::now() + duration;
 
@@ -586,7 +610,7 @@ AutoSSH::wait_or_ssh_exit(std::chrono::seconds duration) {
 
         poll_timer_.expires_after(wait);
         co_await poll_timer_.async_wait(
-            asio::as_tuple(asio::use_awaitable));
+            asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
     }
 
     co_return ssh_running() && !stop_requested();
@@ -596,7 +620,7 @@ AutoSSH::wait_or_ssh_exit(std::chrono::seconds duration) {
 //  Connection testing
 // ════════════════════════════════════════════════════════════════════
 
-asio::awaitable<bool> AutoSSH::test_connection() {
+IoAwaitable<bool> AutoSSH::test_connection() {
     for (int i = 0; i < MAX_CONN_TRIES; i++) {
         if (co_await test_connection_once())
             co_return true;
@@ -608,14 +632,14 @@ asio::awaitable<bool> AutoSSH::test_connection() {
     co_return false;
 }
 
-asio::awaitable<bool> AutoSSH::test_connection_once() {
+IoAwaitable<bool> AutoSSH::test_connection_once() {
     auto executor = co_await asio::this_coro::executor;
 
-    asio::steady_timer timeout(executor);
+    Timer timeout(executor);
     timeout.expires_after(config_.net_timeout);
 
-    tcp::socket write_sock(executor);
-    tcp::socket read_sock(executor);
+    Socket write_sock(executor);
+    Socket read_sock(executor);
 
     auto cancel = [&] {
         error_code ec;
@@ -637,20 +661,20 @@ asio::awaitable<bool> AutoSSH::test_connection_once() {
     tcp::endpoint write_ep(asio::ip::make_address("127.0.0.1"),
                            config_.write_port());
     auto [conn_ec] = co_await write_sock.async_connect(
-        write_ep, asio::as_tuple(asio::use_awaitable));
+        write_ep, asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
     if (conn_ec) { timeout.cancel(); co_return false; }
 
     // 2. Accept the return connection (loop method only)
     if (config_.echo_port == 0 && monitor_acceptor_) {
         auto [acc_ec] = co_await monitor_acceptor_->async_accept(
-            read_sock, asio::as_tuple(asio::use_awaitable));
+            read_sock, asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
         if (acc_ec) { timeout.cancel(); cancel(); co_return false; }
     }
 
     // 3. Send test message
     auto [wec, wn] = co_await asio::async_write(
         write_sock, asio::buffer(test_message_),
-        asio::as_tuple(asio::use_awaitable));
+        asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
     if (wec) { timeout.cancel(); cancel(); co_return false; }
 
     // 4. Read response
@@ -658,7 +682,7 @@ asio::awaitable<bool> AutoSSH::test_connection_once() {
     std::string response(test_message_.size(), '\0');
     auto [rec, rn] = co_await asio::async_read(
         recv, asio::buffer(response),
-        asio::as_tuple(asio::use_awaitable));
+        asio::as_tuple(asio::use_awaitable_t<IoExecutor>{}));
 
     timeout.cancel();
     cancel();

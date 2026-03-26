@@ -131,13 +131,13 @@ template <typename Rep, typename Period>
 
 auto get_env(const char* name) -> std::optional<std::string> {
 #ifdef _WIN32
+    char* raw = nullptr;
     std::size_t len = 0;
-    auto buf =
-        std::unique_ptr<char, decltype(&std::free)>{nullptr, &std::free};
-    if (_dupenv_s(std::out_ptr(buf), &len, name) == 0 && buf) {
-        return std::string(buf.get());
-    }
-    return std::nullopt;
+    if (_dupenv_s(&raw, &len, name) != 0 || raw == nullptr)
+        return std::nullopt;
+
+    auto buf = std::unique_ptr<char, decltype(&std::free)>{raw, &std::free};
+    return std::string(buf.get());
 #else
     if (auto* v = std::getenv(name); v)
         return std::string(v);

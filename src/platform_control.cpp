@@ -5,6 +5,10 @@ module;
 #include <format>
 
 #ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
 #  include <csignal>
 #else
 #  include <csignal>
@@ -26,6 +30,146 @@ namespace {
 [[nodiscard]] auto format_windows_error(DWORD error_number) -> std::string {
     return std::system_category().message(static_cast<int>(error_number));
 }
+
+class ScopedCtrlHandlerIgnore {
+public:
+    ScopedCtrlHandlerIgnore() = default;
+
+    ScopedCtrlHandlerIgnore(const ScopedCtrlHandlerIgnore&) = delete;
+    auto operator=(const ScopedCtrlHandlerIgnore&)
+        -> ScopedCtrlHandlerIgnore& = delete;
+
+    ScopedCtrlHandlerIgnore(ScopedCtrlHandlerIgnore&& other) noexcept
+        : active_(std::exchange(other.active_, false))
+    {
+    }
+
+    auto operator=(ScopedCtrlHandlerIgnore&& other) noexcept
+        -> ScopedCtrlHandlerIgnore&
+    {
+        if (this == &other)
+            return *this;
+
+        reset();
+        active_ = std::exchange(other.active_, false);
+        return *this;
+    }
+
+    ~ScopedCtrlHandlerIgnore() {
+        reset();
+    }
+
+    [[nodiscard]] static auto create()
+        -> std::expected<ScopedCtrlHandlerIgnore, std::string>
+    {
+        if (!::SetConsoleCtrlHandler(nullptr, TRUE)) {
+            const auto error_number = ::GetLastError();
+            return std::unexpected(std::format(
+                "failed to ignore console control events temporarily: {}",
+                format_windows_error(error_number)));
+        }
+
+        ScopedCtrlHandlerIgnore guard;
+        guard.active_ = true;
+        return guard;
+    }
+
+private:
+    void reset() noexcept {
+        if (!active_)
+            return;
+
+        ::SetConsoleCtrlHandler(nullptr, FALSE);
+        active_ = false;
+    }
+
+    bool active_ = false;
+};
+
+class ScopedConsoleAttachment {
+public:
+    ScopedConsoleAttachment() = default;
+
+    ScopedConsoleAttachment(const ScopedConsoleAttachment&) = delete;
+    auto operator=(const ScopedConsoleAttachment&)
+        -> ScopedConsoleAttachment& = delete;
+
+    ScopedConsoleAttachment(ScopedConsoleAttachment&& other) noexcept
+        : detached_existing_console_(
+              std::exchange(other.detached_existing_console_, false))
+        , attached_target_console_(
+              std::exchange(other.attached_target_console_, false))
+    {
+    }
+
+    auto operator=(ScopedConsoleAttachment&& other) noexcept
+        -> ScopedConsoleAttachment&
+    {
+        if (this == &other)
+            return *this;
+
+        reset();
+        detached_existing_console_ =
+            std::exchange(other.detached_existing_console_, false);
+        attached_target_console_ =
+            std::exchange(other.attached_target_console_, false);
+        return *this;
+    }
+
+    ~ScopedConsoleAttachment() {
+        reset();
+    }
+
+    [[nodiscard]] static auto attach_to_process_console(DWORD pid)
+        -> std::expected<ScopedConsoleAttachment, std::string>
+    {
+        ScopedConsoleAttachment attachment;
+
+        if (::GetConsoleWindow() != nullptr) {
+            if (!::FreeConsole()) {
+                const auto error_number = ::GetLastError();
+                return std::unexpected(std::format(
+                    "failed to detach from current console: {}",
+                    format_windows_error(error_number)));
+            }
+            attachment.detached_existing_console_ = true;
+        }
+
+        if (!::AttachConsole(pid)) {
+            const auto error_number = ::GetLastError();
+            if (attachment.detached_existing_console_)
+                attachment.reattach_parent_console();
+            return std::unexpected(std::format(
+                "failed to attach to child console for pid {}: {}",
+                pid,
+                format_windows_error(error_number)));
+        }
+
+        attachment.attached_target_console_ = true;
+        return attachment;
+    }
+
+private:
+    void reset() noexcept {
+        if (attached_target_console_) {
+            ::FreeConsole();
+            attached_target_console_ = false;
+        }
+
+        if (detached_existing_console_) {
+            reattach_parent_console();
+            detached_existing_console_ = false;
+        }
+    }
+
+    void reattach_parent_console() noexcept {
+        [[maybe_unused]] const auto reattached =
+            ::AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
+    bool detached_existing_console_ = false;
+    bool attached_target_console_ = false;
+};
 
 [[nodiscard]] auto control_event_name(RequestedAction action, DWORD pid)
     -> std::wstring
@@ -315,6 +459,42 @@ auto create_control_event(RequestedAction action, DWORD pid)
     }
 
     return event_handle;
+}
+
+auto request_process_group_interrupt(DWORD pid)
+    -> std::expected<void, std::string>
+{
+    if (pid == 0) {
+        return std::unexpected("child pid must be non-zero");
+    }
+
+    auto ignored_ctrl_handler = ScopedCtrlHandlerIgnore::create();
+    if (!ignored_ctrl_handler)
+        return std::unexpected(ignored_ctrl_handler.error());
+
+    if (::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid))
+        return {};
+
+    const auto direct_error = ::GetLastError();
+    auto console_attachment = ScopedConsoleAttachment::attach_to_process_console(pid);
+    if (!console_attachment) {
+        return std::unexpected(std::format(
+            "failed to request graceful console shutdown for pid {}: {}; "
+            "attach fallback failed: {}",
+            pid,
+            format_windows_error(direct_error),
+            console_attachment.error()));
+    }
+
+    if (!::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)) {
+        const auto attached_error = ::GetLastError();
+        return std::unexpected(std::format(
+            "failed to request graceful console shutdown for pid {}: {}",
+            pid,
+            format_windows_error(attached_error)));
+    }
+
+    return {};
 }
 #endif
 
